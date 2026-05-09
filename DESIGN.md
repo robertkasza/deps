@@ -156,7 +156,7 @@ internal/
   triage/                  direct vs transitive + parent identification
   plan/                    SKILL.md ladder → Edits
   registry/                npm registry client (HTTP, in-process cache)
-  report/                  JSON / human / markdown formatters
+  report/                  JSON / human formatters
 ```
 
 Current scaffold has `workspace/`, `audit/`, `apply/` as separate empty packages — those will fold into `pnpm/` once we restructure to match this target.

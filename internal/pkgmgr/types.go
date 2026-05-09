@@ -5,6 +5,10 @@ package pkgmgr
 type Workspace struct {
 	// Dir is the absolute path to the workspace's root directory.
 	Dir string
+	// RelDir is the workspace's directory relative to the monorepo root
+	// using forward slashes (e.g., "apps/admin"). Empty for the root
+	// workspace itself.
+	RelDir string
 	// PackageJSON is the absolute path to the workspace's package.json.
 	PackageJSON string
 	// Name is the value of the "name" field in package.json (may be empty

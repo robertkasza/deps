@@ -9,17 +9,23 @@ package pnpm
 import "github.com/robertkasza/deps/internal/pkgmgr"
 
 // Adapter implements pkgmgr.PkgManager for pnpm.
-type Adapter struct{}
+type Adapter struct {
+	// runner executes external commands. Override in tests to avoid
+	// shelling out to a real `pnpm` binary.
+	runner Runner
+}
 
 // New returns a pnpm adapter.
 func New() *Adapter { return &Adapter{} }
 
-func (a *Adapter) Name() string { return "pnpm" }
-
-func (a *Adapter) Audit(ws pkgmgr.Workspace) ([]pkgmgr.Advisory, error) {
-	// TODO: run `pnpm audit --json` in ws.Dir, parse, attribute advisories.
-	return nil, nil
+// WithRunner returns a copy of a using the given Runner. Used by tests.
+func (a *Adapter) WithRunner(r Runner) *Adapter {
+	cp := *a
+	cp.runner = r
+	return &cp
 }
+
+func (a *Adapter) Name() string { return "pnpm" }
 
 func (a *Adapter) ApplyEdits(edits []pkgmgr.Edit) error {
 	// TODO: mutate package.json files, preserving formatting.

@@ -56,6 +56,7 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 
 	rootWS := pkgmgr.Workspace{
 		Dir:         absRoot,
+		RelDir:      "",
 		PackageJSON: rootPkg,
 		Name:        rootName,
 		IsRoot:      true,
@@ -93,8 +94,13 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 			}
 			return nil, fmt.Errorf("read %s: %w", pj, err)
 		}
+		rel, err := filepath.Rel(absRoot, dir)
+		if err != nil {
+			return nil, fmt.Errorf("relpath %s: %w", dir, err)
+		}
 		out = append(out, pkgmgr.Workspace{
 			Dir:         dir,
+			RelDir:      filepath.ToSlash(rel),
 			PackageJSON: pj,
 			Name:        name,
 			IsRoot:      false,

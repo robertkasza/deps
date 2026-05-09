@@ -1,4 +1,4 @@
-// Package report formats a Plan as JSON, human-readable text, or markdown.
+// Package report formats a Plan as JSON or human-readable text.
 package report
 
 import (
@@ -11,9 +11,8 @@ import (
 type Format string
 
 const (
-	FormatHuman    Format = "human"
-	FormatJSON     Format = "json"
-	FormatMarkdown Format = "markdown"
+	FormatHuman Format = "human"
+	FormatJSON  Format = "json"
 )
 
 // Write renders a Plan to w in the chosen format.
