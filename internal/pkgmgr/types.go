@@ -11,6 +11,12 @@ type Workspace struct {
 	RelDir string
 	// PackageJSON is the absolute path to the workspace's package.json.
 	PackageJSON string
+	// MonorepoRoot is the absolute path to the monorepo root directory
+	// (the one containing pnpm-workspace.yaml). Same value on every
+	// Workspace returned by a single DiscoverWorkspaces call. Equal to
+	// Dir for the root workspace itself, and equal to Dir for a
+	// single-package repo.
+	MonorepoRoot string
 	// Name is the value of the "name" field in package.json (may be empty
 	// for unnamed packages).
 	Name string

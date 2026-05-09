@@ -55,11 +55,12 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 	}
 
 	rootWS := pkgmgr.Workspace{
-		Dir:         absRoot,
-		RelDir:      "",
-		PackageJSON: rootPkg,
-		Name:        rootName,
-		IsRoot:      true,
+		Dir:          absRoot,
+		RelDir:       "",
+		PackageJSON:  rootPkg,
+		MonorepoRoot: absRoot,
+		Name:         rootName,
+		IsRoot:       true,
 	}
 
 	wsYAML := filepath.Join(absRoot, "pnpm-workspace.yaml")
@@ -99,11 +100,12 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 			return nil, fmt.Errorf("relpath %s: %w", dir, err)
 		}
 		out = append(out, pkgmgr.Workspace{
-			Dir:         dir,
-			RelDir:      filepath.ToSlash(rel),
-			PackageJSON: pj,
-			Name:        name,
-			IsRoot:      false,
+			Dir:          dir,
+			RelDir:       filepath.ToSlash(rel),
+			PackageJSON:  pj,
+			MonorepoRoot: absRoot,
+			Name:         name,
+			IsRoot:       false,
 		})
 	}
 
