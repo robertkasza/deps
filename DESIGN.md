@@ -190,6 +190,7 @@ playground/                hand-built fixtures for manual smoke-testing
 
 Things that work but could be nicer. Each is small, none are blocking.
 
+- **`deps version` command (or `--version` flag).** Prints the binary's version, build commit, Go version. Use `runtime/debug.ReadBuildInfo` so it works for both `go install` and `go build`. Add a stable VCS stamp via `-ldflags "-X main.version=..."` for release builds.
 - **Suppress / collapse pnpm's noisy retry warnings.** `pnpm audit` writes "Will retry in 10 seconds" to stderr on rate-limit. Currently visible to the user; could be filtered.
 - **Real `--severity` filter.** Today the flag filters at display only — plan still walks every finding. Could short-circuit before plan for speed.
 - **Better error messages for missing lockfile.** Currently surfaces pnpm's raw error; could detect and tell the user to run `pnpm install` first.
@@ -197,6 +198,12 @@ Things that work but could be nicer. Each is small, none are blocking.
 - **Display improvements.** Group human output by remediation kind, color severity tags, etc.
 
 ## Future features (not yet planned for an MVP+1)
+
+- **`deps prune` — clean up unused overrides.** Identify and optionally remove `pnpm.overrides` entries that are no longer needed (target package no longer in the tree, or a newer parent already ships a fixed transitive). Two modes:
+  - *Conservative (default, read-only):* report likely-unused entries based on `pnpm why` / lockfile inspection. Heuristic, fast, zero risk.
+  - *Authoritative (`--apply`):* test by removal — for each candidate, drop the override, run `pnpm install --lockfile-only`, re-audit. Keep removed if no targeted advisory resurfaces; restore otherwise. Slow but ground-truth.
+
+  Helps keep the override list from growing forever as parent packages get bumped over time.
 
 - **`--max-major-jump <N>` / `--allow-major`.** Let users opt into auto-applying major-version bumps that today land in `unresolved{major-jump-required}`.
 - **`--prefer=bump|override`.** When both a parent bump and an override could resolve the vuln, override the default.
