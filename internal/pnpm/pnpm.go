@@ -16,11 +16,6 @@ func New() *Adapter { return &Adapter{} }
 
 func (a *Adapter) Name() string { return "pnpm" }
 
-func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
-	// TODO: read pnpm-workspace.yaml, expand globs, return root + workspaces.
-	return nil, nil
-}
-
 func (a *Adapter) Audit(ws pkgmgr.Workspace) ([]pkgmgr.Advisory, error) {
 	// TODO: run `pnpm audit --json` in ws.Dir, parse, attribute advisories.
 	return nil, nil
