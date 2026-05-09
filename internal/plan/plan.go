@@ -185,12 +185,27 @@ func (b *Builder) planTransitive(f pkgmgr.Finding, cache manifestCache) (pkgmgr.
 		return pkgmgr.Edit{}, "", fmt.Errorf("registry %s: %w", parent, err)
 	}
 
-	// Find a parent version whose declared dep on `vuln` falls in the fixed range.
-	candidate, fixesInMajor, err := b.findParentFix(parent, versions, anchor, vuln, fixedVuln, true)
+	// chain is the full dep path from parent down to vuln, e.g.
+	// [@scalar/openapi-parser, ajv, fast-uri]. f.Advisory.Path includes
+	// the parent at index 0; chain is everything after.
+	chain := f.Advisory.Path
+	if len(chain) > 0 && chain[0] == parent {
+		chain = chain[1:]
+	}
+
+	// Find a parent version whose dep tree resolves the vuln pkg to a
+	// fixed version (walking the chain at each candidate).
+	candidate, predicted, err := b.findParentFix(parent, versions, anchor, chain, fixedVuln, true)
 	if err != nil {
 		return pkgmgr.Edit{}, "", err
 	}
 	if candidate != nil {
+		reason := fmt.Sprintf("predicted to patch transitive %s (chain no longer reaches it; %s)",
+			vuln, f.Advisory.GHSA)
+		if predicted != nil {
+			reason = fmt.Sprintf("predicted to patch transitive %s (resolves to %s@%s; %s)",
+				vuln, vuln, predicted.Original(), f.Advisory.GHSA)
+		}
 		return pkgmgr.Edit{
 			Kind:    pkgmgr.EditBumpParent,
 			File:    f.Advisory.Workspace.PackageJSON,
@@ -198,19 +213,16 @@ func (b *Builder) planTransitive(f pkgmgr.Finding, cache manifestCache) (pkgmgr.
 			Field:   string(field),
 			From:    currentParent,
 			To:      applyOperator(op, candidate),
-			Reason:  fmt.Sprintf("patches transitive %s (%s)", vuln, f.Advisory.GHSA),
+			Reason:  reason,
 		}, "", nil
 	}
 
-	if fixesInMajor {
-		// Shouldn't happen given earlier branch, defensive.
-		return pkgmgr.Edit{}, ReasonMajorJumpRequired, nil
-	}
-
 	// Try a major bump of the parent — does any newer-major parent fix the vuln?
-	if newerMajor, _, err := b.findParentFix(parent, versions, anchor, vuln, fixedVuln, false); err != nil {
+	newerMajor, _, err := b.findParentFix(parent, versions, anchor, chain, fixedVuln, false)
+	if err != nil {
 		return pkgmgr.Edit{}, "", err
-	} else if newerMajor != nil {
+	}
+	if newerMajor != nil {
 		return pkgmgr.Edit{}, ReasonMajorJumpRequired, nil
 	}
 
@@ -218,23 +230,123 @@ func (b *Builder) planTransitive(f pkgmgr.Finding, cache manifestCache) (pkgmgr.
 	return b.planOverride(f), "", nil
 }
 
-// findParentFix walks parent versions looking for the smallest one
-// whose dep on `vuln` lies in fixed. If sameMajor is true, only
-// considers parent versions sharing anchor's major; otherwise only
-// considers strictly-greater majors.
+// findParentFix picks the latest non-prerelease parent version in the
+// requested band (same major, or strictly-greater major), then walks
+// the dep chain from that version to check if the vuln package
+// resolves to a fixed version.
 //
-// Returns the chosen version (nil if none), and a boolean noting
-// whether any candidate satisfied (used by the caller as a tiebreak —
-// currently always false on success).
+// We don't search smaller versions because vuln fixes propagate
+// forward in time: once the upstream vuln package shipped a fix and
+// each intermediate updated its dep range, only versions released
+// after that point can carry the fix. Older versions of the parent
+// can't possibly include a fix in their transitive tree.
+//
+// Returns the chosen parent version and the predicted resolved
+// version of the vuln at the end of the chain. predictedVuln is nil
+// when the chain breaks before reaching the vuln (the vuln is no
+// longer transitively pulled in at all).
 func (b *Builder) findParentFix(
 	parent string,
 	versions []string,
 	anchor *semver.Version,
-	vuln string,
+	chain []string,
 	fixed *semver.Constraints,
 	sameMajor bool,
-) (*semver.Version, bool, error) {
-	var candidates []*semver.Version
+) (parentVer *semver.Version, predictedVuln *semver.Version, err error) {
+	var latest *semver.Version
+	for _, raw := range versions {
+		v, perr := semver.NewVersion(raw)
+		if perr != nil {
+			continue
+		}
+		if v.Prerelease() != "" {
+			continue
+		}
+		if sameMajor {
+			if v.Major() != anchor.Major() || !v.GreaterThan(anchor) {
+				continue
+			}
+		} else if v.Major() <= anchor.Major() {
+			continue
+		}
+		if latest == nil || v.GreaterThan(latest) {
+			latest = v
+		}
+	}
+	if latest == nil {
+		return nil, nil, nil
+	}
+
+	fixes, predicted, err := b.chainFixesVuln(parent, latest.Original(), chain, fixed)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !fixes {
+		return nil, nil, nil
+	}
+	return latest, predicted, nil
+}
+
+// chainFixesVuln walks chain forward from parent@version, picking the
+// lowest satisfying version at each hop, and reports whether the final
+// resolved version of the vuln package lies inside the fixed range.
+//
+// We are strict about confirmation: the walk must reach the final
+// hop (the vuln package) AND that resolved version must be in fixed.
+// If any intermediate hop's parent stops declaring the next package
+// in the chain, we DO NOT treat that as a fix — the vuln may still be
+// transitively reachable via a different chain we don't follow. Such
+// cases fall through to override, which is always safe.
+//
+// Picking lowest at each hop is conservative: if the lowest-allowable
+// resolution is fixed, every actual resolution must also be fixed.
+// False negatives (pnpm would pick a fixed version but we pessimistically
+// pick a vulnerable one) also fall through to override.
+func (b *Builder) chainFixesVuln(
+	pkg, version string,
+	chain []string,
+	fixed *semver.Constraints,
+) (fixes bool, predicted *semver.Version, err error) {
+	if len(chain) == 0 {
+		return false, nil, nil
+	}
+	for i, next := range chain {
+		m, err := b.Registry.Manifest(pkg, version)
+		if err != nil {
+			return false, nil, err
+		}
+		declared, ok := m.Dependencies[next]
+		if !ok {
+			// Chain broken at this hop. We cannot confirm the vuln is
+			// no longer reachable without walking the full transitive
+			// tree, which we don't do. Be conservative.
+			return false, nil, nil
+		}
+		c, err := semver.NewConstraint(declared)
+		if err != nil {
+			return false, nil, nil
+		}
+		nextVersions, err := b.Registry.Versions(next)
+		if err != nil {
+			return false, nil, err
+		}
+		chosen := lowestSatisfying(nextVersions, c)
+		if chosen == nil {
+			return false, nil, nil
+		}
+		if i == len(chain)-1 {
+			return fixed.Check(chosen), chosen, nil
+		}
+		pkg = next
+		version = chosen.Original()
+	}
+	return false, nil, nil
+}
+
+// lowestSatisfying returns the lowest non-prerelease version in
+// versions that satisfies c, or nil if none qualifies.
+func lowestSatisfying(versions []string, c *semver.Constraints) *semver.Version {
+	var pool []*semver.Version
 	for _, raw := range versions {
 		v, err := semver.NewVersion(raw)
 		if err != nil {
@@ -243,49 +355,22 @@ func (b *Builder) findParentFix(
 		if v.Prerelease() != "" {
 			continue
 		}
-		if sameMajor {
-			if v.Major() != anchor.Major() {
-				continue
-			}
-			if !v.GreaterThan(anchor) {
-				continue
-			}
-		} else {
-			if v.Major() <= anchor.Major() {
-				continue
-			}
+		if !c.Check(v) {
+			continue
 		}
-		candidates = append(candidates, v)
+		pool = append(pool, v)
 	}
-
-	// Sort smallest-first.
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].LessThan(candidates[i]) {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
+	if len(pool) == 0 {
+		return nil
+	}
+	for i := 0; i < len(pool); i++ {
+		for j := i + 1; j < len(pool); j++ {
+			if pool[j].LessThan(pool[i]) {
+				pool[i], pool[j] = pool[j], pool[i]
 			}
 		}
 	}
-
-	for _, v := range candidates {
-		m, err := b.Registry.Manifest(parent, v.Original())
-		if err != nil {
-			return nil, false, fmt.Errorf("registry manifest %s@%s: %w", parent, v.Original(), err)
-		}
-		declared, ok := m.Dependencies[vuln]
-		if !ok {
-			// Parent version no longer pulls in vuln at all -> still a fix.
-			return v, false, nil
-		}
-		// If the parent's declared dep range is fully inside the fixed range,
-		// we know the resolved sub-dep can't be vulnerable. Approximate by
-		// treating the lower bound of the parent's declared range as the
-		// resolution outcome.
-		if anchor := extractAnchor(declared); anchor != nil && fixed.Check(anchor) {
-			return v, false, nil
-		}
-	}
-	return nil, false, nil
+	return pool[0]
 }
 
 // planOverride builds an EditOverrideAdd targeting the monorepo root's

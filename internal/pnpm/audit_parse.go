@@ -50,12 +50,13 @@ func parseAudit(data []byte, ws pkgmgr.Workspace) ([]pkgmgr.Advisory, error) {
 	}
 
 	wsPrefix := workspacePathPrefix(ws)
+	globalMode := detectGlobalMode(raw)
 
 	var out []pkgmgr.Advisory
 	for _, adv := range raw.Advisories {
 		for _, finding := range adv.Findings {
 			for _, path := range finding.Paths {
-				chain, ok := matchPath(path, wsPrefix, ws.IsRoot)
+				chain, ok := matchPath(path, wsPrefix, ws.IsRoot, globalMode)
 				if !ok {
 					continue
 				}
@@ -84,15 +85,48 @@ func workspacePathPrefix(ws pkgmgr.Workspace) string {
 	return strings.ReplaceAll(ws.RelDir, "/", "__")
 }
 
+// detectGlobalMode reports whether the audit output is in "global"
+// path-encoding mode. In global mode, at least one path's first
+// segment uses the "__"-encoded workspace form (e.g., "apps__admin").
+// In per-workspace mode every path starts with ".".
+//
+// Modes correspond to pnpm's `node-linker` setting (and possibly
+// pnpm version): hoisted layouts produce global output; isolated
+// layouts produce per-workspace output.
+func detectGlobalMode(raw auditOutput) bool {
+	for _, adv := range raw.Advisories {
+		for _, finding := range adv.Findings {
+			for _, p := range finding.Paths {
+				if i := strings.Index(p, ">"); i > 0 {
+					if strings.Contains(p[:i], "__") {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // matchPath returns (chain, true) if path originates in the workspace
 // whose prefix is given. chain is the dependency chain after the
 // workspace segment, split on ">".
 //
-// pnpm encodes the originating workspace as the first path segment:
-//   - root workspace: "." (e.g., ".>lodash")
-//   - other workspaces: dir with slashes replaced by "__"
-//     (e.g., "apps__admin>request>tough-cookie")
-func matchPath(path, wsPrefix string, isRoot bool) ([]string, bool) {
+// pnpm emits one of two path encodings; both must be handled:
+//
+//  1. Per-workspace mode (isolated node-linker): paths start with ".".
+//     Output is already scoped to the workspace where audit ran, so we
+//     accept all "." paths and ignore wsPrefix.
+//     Example: ".>@astrojs/vercel>...>fast-uri"
+//
+//  2. Global mode (hoisted node-linker): paths start with the
+//     workspace dir, slashes replaced by "__". Audit output spans all
+//     workspaces; filter to ours by prefix. "." in this mode means the
+//     root workspace specifically.
+//     Example: "apps__admin>request>tough-cookie", ".>lodash" (root)
+//
+// detectGlobalMode disambiguates the two by scanning the doc once.
+func matchPath(path, wsPrefix string, isRoot, globalMode bool) ([]string, bool) {
 	if path == "" {
 		return nil, false
 	}
@@ -101,11 +135,22 @@ func matchPath(path, wsPrefix string, isRoot bool) ([]string, bool) {
 		return nil, false
 	}
 
-	expected := wsPrefix
-	if isRoot {
-		expected = "."
+	if !globalMode {
+		// Per-workspace mode: every path is "."-prefixed and belongs to ws.
+		if segments[0] != "." {
+			return nil, false
+		}
+		return segments[1:], true
 	}
-	if segments[0] != expected {
+
+	// Global mode.
+	if isRoot {
+		if segments[0] != "." {
+			return nil, false
+		}
+		return segments[1:], true
+	}
+	if segments[0] != wsPrefix {
 		return nil, false
 	}
 	return segments[1:], true

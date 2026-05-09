@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -49,6 +50,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	pm := pnpm.New()
+	fmt.Fprintln(stderr, "discovering workspaces...")
 	workspaces, err := pm.DiscoverWorkspaces(opts.Dir)
 	if err != nil {
 		return fmt.Errorf("discover workspaces: %w", err)
@@ -58,11 +60,13 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	planner := plan.New(reg)
 
 	// Phase 1: produce the plan (audit + triage + plan per workspace).
-	results := processAll(pm, planner, workspaces, opts.Concurrency)
+	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
+		len(workspaces), opts.Concurrency)
+	results := processAll(pm, planner, workspaces, opts.Concurrency, stderr)
 
 	totalActionable, totalUnresolved, failedCount := summarize(results)
 	fmt.Fprintf(stderr,
-		"plan: %d actionable, %d unresolved, %d failure(s)\n",
+		"plan: %d actionable finding(s), %d unresolved, %d failure(s)\n",
 		totalActionable, totalUnresolved, failedCount)
 
 	if failedCount > 0 {
@@ -78,8 +82,9 @@ func Run(args []string, stdout, stderr io.Writer) error {
 
 	// Phase 2: apply edits.
 	allEdits, targetedGHSAs, editedWorkspaces, hasOverride := flatten(results)
-	fmt.Fprintf(stderr, "applying %d edit(s)...\n", len(allEdits))
-	if err := pm.ApplyEdits(allEdits); err != nil {
+	fmt.Fprintf(stderr, "applying %d candidate edit(s)...\n", len(allEdits))
+	applied, err := pm.ApplyEdits(allEdits)
+	if err != nil {
 		return exitErr{code: 1, msg: fmt.Sprintf("apply edits: %v", err)}
 	}
 
@@ -98,14 +103,15 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		verifyScope = filterWorkspaces(workspaces, editedWorkspaces)
 	}
 	fmt.Fprintf(stderr, "re-auditing %d workspace(s)...\n", len(verifyScope))
-	verify := processAll(pm, planner, verifyScope, opts.Concurrency)
+	verify := processAll(pm, planner, verifyScope, opts.Concurrency, stderr)
 	stillPresent := stillPresentGHSAs(verify, targetedGHSAs)
 
 	// Final report. Three distinct buckets the user needs to see:
 	// (1) what we applied and verified, (2) what we tried but failed
 	// to clear, (3) what we deliberately did NOT try (unresolved).
 	fmt.Fprintf(stderr, "\nfix complete:\n")
-	fmt.Fprintf(stderr, "  %d edit(s) applied\n", len(allEdits))
+	fmt.Fprintf(stderr, "  %d edit(s) applied:\n", len(applied))
+	printApplied(stderr, applied, rootDir)
 
 	if len(stillPresent) > 0 {
 		fmt.Fprintf(stderr, "  %d advisory(ies) still present after re-audit (apply did not clear them):\n",
@@ -134,6 +140,36 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+// printApplied prints one line per edit that was actually written to
+// disk (post-coalesce). Locations are shown relative to rootDir.
+func printApplied(w io.Writer, applied []pkgmgr.Edit, rootDir string) {
+	for _, e := range applied {
+		loc := editLocation(e.File, rootDir)
+		switch e.Kind {
+		case pkgmgr.EditBumpDirect, pkgmgr.EditBumpParent:
+			fmt.Fprintf(w, "    %s  %s  %s -> %s  (%s)  in %s\n",
+				e.Kind, e.Package, e.From, e.To, e.Field, loc)
+		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate:
+			fmt.Fprintf(w, "    override     %s@%s -> %s  in %s\n",
+				e.Package, e.VulnerableRange, e.To, loc)
+		default:
+			fmt.Fprintf(w, "    %s  %+v\n", e.Kind, e)
+		}
+	}
+}
+
+// editLocation returns a human-readable workspace path for an edit's
+// target file: the package.json's parent dir relative to rootDir, or
+// "<root>" when the edit lives in the monorepo root's package.json.
+func editLocation(file, rootDir string) string {
+	dir := filepath.Dir(file)
+	rel, err := filepath.Rel(rootDir, dir)
+	if err != nil || rel == "" || rel == "." {
+		return "<root>"
+	}
+	return rel
+}
+
 func printUnresolved(w io.Writer, results []WorkspaceResult) {
 	for _, r := range results {
 		if r.Err != nil {
@@ -141,17 +177,23 @@ func printUnresolved(w io.Writer, results []WorkspaceResult) {
 		}
 		for _, u := range r.Plan.Unresolved {
 			a := u.Finding.Advisory
-			ws := r.Workspace.Name
-			if ws == "" {
-				ws = r.Workspace.RelDir
-				if ws == "" {
-					ws = "<root>"
-				}
-			}
 			fmt.Fprintf(w, "    - %s  %s  %s  (%s)  in %s\n",
-				a.GHSA, a.Package, a.Severity, u.Reason, ws)
+				a.GHSA, a.Package, a.Severity, u.Reason, workspaceLabel(r.Workspace))
 		}
 	}
+}
+
+func workspaceLabel(ws pkgmgr.Workspace) string {
+	if ws.IsRoot {
+		return "<root>"
+	}
+	if ws.RelDir != "" {
+		return ws.RelDir
+	}
+	if ws.Name != "" {
+		return ws.Name
+	}
+	return "<unnamed>"
 }
 
 // WorkspaceResult mirrors checkcmd.WorkspaceResult but is local to
@@ -169,6 +211,7 @@ func processAll(
 	planner *plan.Builder,
 	workspaces []pkgmgr.Workspace,
 	concurrency int,
+	progress io.Writer,
 ) []WorkspaceResult {
 	if concurrency < 1 {
 		concurrency = 1
@@ -176,6 +219,23 @@ func processAll(
 	results := make([]WorkspaceResult, len(workspaces))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	var (
+		progressMu sync.Mutex
+		done       int
+		total      = len(workspaces)
+	)
+
+	report := func(ws pkgmgr.Workspace, err error) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		done++
+		label := workspaceLabel(ws)
+		if err != nil {
+			fmt.Fprintf(progress, "  x %s (%d/%d): %v\n", label, done, total, err)
+		} else {
+			fmt.Fprintf(progress, "  o %s (%d/%d)\n", label, done, total)
+		}
+	}
 
 	for i, ws := range workspaces {
 		wg.Add(1)
@@ -186,19 +246,23 @@ func processAll(
 			advs, err := pm.Audit(ws)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
+				report(ws, err)
 				return
 			}
 			findings, err := triage.Run(advs)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
+				report(ws, err)
 				return
 			}
 			p, err := planner.Build(findings)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Err: err}
+				report(ws, err)
 				return
 			}
 			results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Plan: p}
+			report(ws, nil)
 		}(i, ws)
 	}
 	wg.Wait()

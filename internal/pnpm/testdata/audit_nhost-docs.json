@@ -1,0 +1,120 @@
+{
+  "actions": [
+    {
+      "action": "update",
+      "resolves": [
+        {
+          "id": 1117870,
+          "path": ".>@astrojs/vercel>@vercel/routing-utils>ajv>fast-uri",
+          "dev": false,
+          "optional": false,
+          "bundled": false
+        },
+        {
+          "id": 1117884,
+          "path": ".>@astrojs/vercel>@vercel/routing-utils>ajv>fast-uri",
+          "dev": false,
+          "optional": false,
+          "bundled": false
+        }
+      ],
+      "module": "fast-uri",
+      "target": "3.1.2",
+      "depth": 5
+    }
+  ],
+  "advisories": {
+    "1117870": {
+      "findings": [
+        {
+          "version": "3.1.0",
+          "paths": [
+            ".>@astrojs/vercel>@vercel/routing-utils>ajv>fast-uri"
+          ]
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-q3j6-qgpj-74h6\n- https://nvd.nist.gov/vuln/detail/CVE-2026-6321\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/advisories/GHSA-q3j6-qgpj-74h6",
+      "created": "2026-05-08T17:15:09.000Z",
+      "id": 1117870,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri` v3.1.0 and earlier decodes percent-encoded path separators (`%2F`) and dot segments (`%2E`) before applying dot-segment removal in `normalize()` and `equal()`. This makes encoded path data behave like real `/` and `..`, so distinct URIs collapse onto the same normalized path.\n\nFor example, `http://example.com/public/%2e%2e/admin` normalizes to `http://example.com/admin`, and `equal()` considers them the same URI.\n\nApplications that normalize or compare attacker-controlled URLs to enforce path-based policy can be bypassed. A path that looks confined under an allowed prefix can normalize to a different location.\n\n### Patches\n\nUpgrade to `fast-uri` >= 3.1.1.\n\n### Workarounds\n\nNone. Upgrade to the patched version.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to path traversal via percent-encoded dot segments",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-6321"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "fast-uri",
+      "vulnerable_versions": "<=3.1.0",
+      "github_advisory_id": "GHSA-q3j6-qgpj-74h6",
+      "recommendation": "Upgrade to version 3.1.1 or later",
+      "patched_versions": ">=3.1.1",
+      "updated": "2026-05-08T17:15:11.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
+      },
+      "cwe": [
+        "CWE-22"
+      ],
+      "url": "https://github.com/advisories/GHSA-q3j6-qgpj-74h6"
+    },
+    "1117884": {
+      "findings": [
+        {
+          "version": "3.1.0",
+          "paths": [
+            ".>@astrojs/vercel>@vercel/routing-utils>ajv>fast-uri"
+          ]
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-v39h-62p7-jpjc\n- https://nvd.nist.gov/vuln/detail/CVE-2026-6322\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/advisories/GHSA-v39h-62p7-jpjc",
+      "created": "2026-05-08T19:13:01.000Z",
+      "id": 1117884,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri` v3.1.1 and earlier decodes percent-encoded authority delimiters (`%40` as `@`, `%3A` as `:`) inside the host component and serializes them back as raw characters. This changes the URI structure, turning a hostname into userinfo plus a different host.\n\nFor example, `http://trusted.com%40evil.com/` normalizes to `http://trusted.com@evil.com/`, which reparses as host `evil.com` with userinfo `trusted.com`.\n\nApplications that normalize untrusted URLs before host allowlist checks, redirect validation, or outbound request routing can be steered to a different authority than the original URL appeared to contain.\n\n### Patches\n\nUpgrade to `fast-uri` >= 3.1.2.\n\n### Workarounds\n\nNone. Upgrade to the patched version.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to host confusion via percent-encoded authority delimiters",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-6322"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "fast-uri",
+      "vulnerable_versions": "<=3.1.1",
+      "github_advisory_id": "GHSA-v39h-62p7-jpjc",
+      "recommendation": "Upgrade to version 3.1.2 or later",
+      "patched_versions": ">=3.1.2",
+      "updated": "2026-05-08T19:13:02.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
+      },
+      "cwe": [
+        "CWE-436"
+      ],
+      "url": "https://github.com/advisories/GHSA-v39h-62p7-jpjc"
+    }
+  },
+  "muted": [],
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 2,
+      "critical": 0
+    },
+    "dependencies": 558,
+    "devDependencies": 0,
+    "optionalDependencies": 0,
+    "totalDependencies": 558
+  }
+}

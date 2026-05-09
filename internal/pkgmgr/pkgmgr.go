@@ -21,8 +21,10 @@ type PkgManager interface {
 	Audit(ws Workspace) ([]Advisory, error)
 
 	// ApplyEdits writes Edits to disk. Implementations preserve formatting
-	// of existing package.json files (indent detection, trailing newline).
-	ApplyEdits(edits []Edit) error
+	// of existing package.json files. Returns the edits that were
+	// actually applied — typically fewer than the input because edits
+	// targeting the same package or override key are coalesced.
+	ApplyEdits(edits []Edit) ([]Edit, error)
 
 	// Install regenerates the lockfile after edits. lockfileOnly == true
 	// skips populating node_modules.

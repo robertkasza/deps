@@ -207,7 +207,6 @@ Things that work but could be nicer. Each is small, none are blocking.
 
 - **`--max-major-jump <N>` / `--allow-major`.** Let users opt into auto-applying major-version bumps that today land in `unresolved{major-jump-required}`.
 - **`--prefer=bump|override`.** When both a parent bump and an override could resolve the vuln, override the default.
-- **Override consolidation.** Today `override-add` always appends; we should detect overlapping ranges and consolidate (e.g., `foo@<1.2.0` + `foo@<1.5.0` → single `foo@<1.5.0`).
 - **npm / yarn adapters.** Slot into `internal/npm/`, `internal/yarn/`. The pkgmgr seam is already in place.
 - **Auth handling for private registries** (e.g., `_authToken=`).
 - **GitHub Action wrapper repo.** Schedule + PR creation; thin wrapper around `deps fix`.

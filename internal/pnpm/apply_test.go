@@ -18,7 +18,7 @@ func TestApplyEdits_BumpDirect(t *testing.T) {
 }
 `)
 	a := New()
-	err := a.ApplyEdits([]pkgmgr.Edit{
+	_, err := a.ApplyEdits([]pkgmgr.Edit{
 		{
 			Kind:    pkgmgr.EditBumpDirect,
 			File:    pj,
@@ -48,7 +48,7 @@ func TestApplyEdits_CoalescesSamePackage(t *testing.T) {
 	a := New()
 	// Three edits for the same lodash, increasing target versions.
 	// Highest (4.18.0) should win.
-	err := a.ApplyEdits([]pkgmgr.Edit{
+	_, err := a.ApplyEdits([]pkgmgr.Edit{
 		{Kind: pkgmgr.EditBumpDirect, File: pj, Package: "lodash", Field: "dependencies", To: "^4.17.21"},
 		{Kind: pkgmgr.EditBumpDirect, File: pj, Package: "lodash", Field: "dependencies", To: "^4.18.0"},
 		{Kind: pkgmgr.EditBumpDirect, File: pj, Package: "lodash", Field: "dependencies", To: "^4.17.23"},
@@ -62,13 +62,51 @@ func TestApplyEdits_CoalescesSamePackage(t *testing.T) {
 	}
 }
 
+func TestApplyEdits_CoalescesOverlappingOverrides(t *testing.T) {
+	// Two GHSAs for fast-uri produce two override edits with overlapping
+	// vulnerable ranges; the broader one (<=3.1.1, >=3.1.2) supersedes
+	// the narrower (<=3.1.0, >=3.1.1) and only one entry should be
+	// written.
+	root := t.TempDir()
+	writeFile(t, root, "package.json", `{"name": "demo"}`+"\n")
+	writeFile(t, root, "pnpm-workspace.yaml", "packages:\n  - apps/*\n")
+
+	a := New()
+	_, err := a.ApplyEdits([]pkgmgr.Edit{
+		{
+			Kind:            pkgmgr.EditOverrideAdd,
+			File:            filepath.Join(root, "package.json"),
+			Package:         "fast-uri",
+			VulnerableRange: "<=3.1.0",
+			To:              ">=3.1.1",
+		},
+		{
+			Kind:            pkgmgr.EditOverrideAdd,
+			File:            filepath.Join(root, "package.json"),
+			Package:         "fast-uri",
+			VulnerableRange: "<=3.1.1",
+			To:              ">=3.1.2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyEdits: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(root, "package.json"))
+	if !strings.Contains(string(got), `"fast-uri@<=3.1.1": ">=3.1.2"`) {
+		t.Errorf("missing merged override: %s", got)
+	}
+	if strings.Contains(string(got), `"fast-uri@<=3.1.0"`) {
+		t.Errorf("narrower override should have been dropped: %s", got)
+	}
+}
+
 func TestApplyEdits_OverrideAdd(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "package.json", `{"name": "demo"}`+"\n")
 	writeFile(t, root, "pnpm-workspace.yaml", "packages:\n  - apps/*\n")
 
 	a := New()
-	err := a.ApplyEdits([]pkgmgr.Edit{
+	_, err := a.ApplyEdits([]pkgmgr.Edit{
 		{
 			Kind:            pkgmgr.EditOverrideAdd,
 			File:            filepath.Join(root, "package.json"),

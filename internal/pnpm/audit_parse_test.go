@@ -96,6 +96,32 @@ func TestParseAudit_VulnTestFixture(t *testing.T) {
 	}
 }
 
+func TestParseAudit_NhostDocsFixture_PerWorkspaceMode(t *testing.T) {
+	// nhost emits per-workspace mode: paths start with ".". The fixture
+	// is captured from `pnpm audit --json` inside docs/ which has two
+	// fast-uri advisories reachable via @astrojs/vercel.
+	data := loadFixture(t, "audit_nhost-docs.json")
+	ws := pkgmgr.Workspace{
+		Name:   "docs",
+		RelDir: "docs",
+	}
+	advs, err := parseAudit(data, ws)
+	if err != nil {
+		t.Fatalf("parseAudit: %v", err)
+	}
+	if len(advs) == 0 {
+		t.Errorf("expected fast-uri advisories, got none")
+	}
+	for _, a := range advs {
+		if a.Package != "fast-uri" {
+			t.Errorf("unexpected package %q", a.Package)
+		}
+		if len(a.Path) == 0 {
+			t.Errorf("empty path for %s", a.GHSA)
+		}
+	}
+}
+
 func TestParseAudit_Errors(t *testing.T) {
 	ws := pkgmgr.Workspace{IsRoot: true}
 
@@ -117,31 +143,42 @@ func TestParseAudit_Errors(t *testing.T) {
 
 func TestMatchPath(t *testing.T) {
 	tests := []struct {
-		path     string
-		prefix   string
-		isRoot   bool
-		want     []string
-		wantOk   bool
+		name       string
+		path       string
+		prefix     string
+		isRoot     bool
+		globalMode bool
+		want       []string
+		wantOk     bool
 	}{
-		{"apps__admin>request", "apps__admin", false, []string{"request"}, true},
-		{"apps__admin>request>tough-cookie", "apps__admin", false, []string{"request", "tough-cookie"}, true},
-		{"apps__admin>request", "packages__utils", false, nil, false},
-		{".>lodash", "", true, []string{"lodash"}, true},
-		{".>request>tough-cookie", "", true, []string{"request", "tough-cookie"}, true},
-		{"apps__admin>request", "", true, nil, false}, // workspace path, not root
-		{"lodash", "", true, nil, false},              // single segment can't originate anywhere
-		{"", "apps__admin", false, nil, false},
+		// Global mode (vuln-test fixture style).
+		{"global: workspace finding via prefix", "apps__admin>request", "apps__admin", false, true, []string{"request"}, true},
+		{"global: deep transitive", "apps__admin>request>tough-cookie", "apps__admin", false, true, []string{"request", "tough-cookie"}, true},
+		{"global: other workspace's finding rejected", "apps__admin>request", "packages__utils", false, true, nil, false},
+		{"global: root finding via dot", ".>lodash", "", true, true, []string{"lodash"}, true},
+		{"global: root rejects workspace prefix", "apps__admin>request", "", true, true, nil, false},
+		{"global: dot path NOT for non-root ws", ".>lodash", "apps__web", false, true, nil, false},
+
+		// Per-workspace mode (nhost style).
+		{"per-ws: dot path for current ws", ".>fast-uri", "docs", false, false, []string{"fast-uri"}, true},
+		{"per-ws: deep transitive", ".>ajv>fast-uri", "docs", false, false, []string{"ajv", "fast-uri"}, true},
+		{"per-ws: dot path for root", ".>lodash", "", true, false, []string{"lodash"}, true},
+		{"per-ws: rejects __ prefix", "apps__admin>request", "apps__admin", false, false, nil, false},
+
+		// Edge cases.
+		{"empty path", "", "apps__admin", false, true, nil, false},
+		{"single segment", "lodash", "", true, true, nil, false},
 	}
 	for _, tc := range tests {
-		got, ok := matchPath(tc.path, tc.prefix, tc.isRoot)
-		if ok != tc.wantOk {
-			t.Errorf("matchPath(%q,%q,root=%v) ok: got %v, want %v",
-				tc.path, tc.prefix, tc.isRoot, ok, tc.wantOk)
-		}
-		if !equalSlices(got, tc.want) {
-			t.Errorf("matchPath(%q,%q,root=%v) chain: got %v, want %v",
-				tc.path, tc.prefix, tc.isRoot, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := matchPath(tc.path, tc.prefix, tc.isRoot, tc.globalMode)
+			if ok != tc.wantOk {
+				t.Errorf("ok: got %v, want %v", ok, tc.wantOk)
+			}
+			if !equalSlices(got, tc.want) {
+				t.Errorf("chain: got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -146,6 +146,7 @@ func TestBuild_TransitiveBumpParentInSameMajor(t *testing.T) {
 	reg := &fakeRegistry{
 		versions: map[string][]string{
 			"body-parser": {"1.19.0", "1.20.3"},
+			"qs":          {"6.7.0", "6.13.0"},
 		},
 		manifests: map[string]map[string]registry.Manifest{
 			"body-parser": {
@@ -239,7 +240,8 @@ func TestBuild_TransitiveMajorJumpRequired(t *testing.T) {
 
 	reg := &fakeRegistry{
 		versions: map[string][]string{
-			"foo": {"1.0.0", "1.5.0", "2.0.0"},
+			"foo":  {"1.0.0", "1.5.0", "2.0.0"},
+			"vuln": {"1.0.0", "2.0.0"},
 		},
 		manifests: map[string]map[string]registry.Manifest{
 			"foo": {

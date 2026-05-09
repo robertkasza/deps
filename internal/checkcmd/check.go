@@ -45,14 +45,17 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	pm := pnpm.New()
+	fmt.Fprintln(stderr, "discovering workspaces...")
 	workspaces, err := pm.DiscoverWorkspaces(opts.Dir)
 	if err != nil {
 		return fmt.Errorf("discover workspaces: %w", err)
 	}
+	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
+		len(workspaces), opts.Concurrency)
 
 	reg := registry.New()
 	planner := plan.New(reg)
-	results := processAll(pm, planner, workspaces, opts.Concurrency)
+	results := processAll(pm, planner, workspaces, opts.Concurrency, stderr)
 
 	rootDir := opts.Dir
 	for _, ws := range workspaces {
@@ -214,12 +217,14 @@ type WorkspaceResult struct {
 // processAll runs the audit -> triage -> plan pipeline per workspace,
 // concurrently, bounded by concurrency. Order in the result matches
 // the input order. The registry cache inside the planner is shared
-// across goroutines (it's safe for concurrent use).
+// across goroutines (it's safe for concurrent use). Progress lines
+// are written to progress as each workspace completes.
 func processAll(
 	pm pkgmgr.PkgManager,
 	planner *plan.Builder,
 	workspaces []pkgmgr.Workspace,
 	concurrency int,
+	progress io.Writer,
 ) []WorkspaceResult {
 	if concurrency < 1 {
 		concurrency = 1
@@ -227,6 +232,23 @@ func processAll(
 	results := make([]WorkspaceResult, len(workspaces))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	var (
+		progressMu sync.Mutex
+		done       int
+		total      = len(workspaces)
+	)
+
+	report := func(ws pkgmgr.Workspace, err error) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		done++
+		label := workspaceLabel(ws)
+		if err != nil {
+			fmt.Fprintf(progress, "  x %s (%d/%d): %v\n", label, done, total, err)
+		} else {
+			fmt.Fprintf(progress, "  o %s (%d/%d)\n", label, done, total)
+		}
+	}
 
 	for i, ws := range workspaces {
 		wg.Add(1)
@@ -237,19 +259,23 @@ func processAll(
 			advs, err := pm.Audit(ws)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
+				report(ws, err)
 				return
 			}
 			findings, err := triage.Run(advs)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
+				report(ws, err)
 				return
 			}
 			p, err := planner.Build(findings)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Err: err}
+				report(ws, err)
 				return
 			}
 			results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Plan: p}
+			report(ws, nil)
 		}(i, ws)
 	}
 	wg.Wait()
@@ -306,15 +332,23 @@ func printResults(w io.Writer, results []WorkspaceResult, minSev int) {
 }
 
 func workspaceHeader(ws pkgmgr.Workspace) string {
-	tag := ""
+	return "- " + workspaceLabel(ws)
+}
+
+// workspaceLabel returns a human-friendly identifier for a workspace,
+// preferring the relative dir (which is grep-able and cd-able) over
+// the package.json name (which may not reflect on-disk location).
+func workspaceLabel(ws pkgmgr.Workspace) string {
 	if ws.IsRoot {
-		tag = " (root)"
+		return "<root>"
 	}
-	name := ws.Name
-	if name == "" {
-		name = "<unnamed>"
+	if ws.RelDir != "" {
+		return ws.RelDir
 	}
-	return fmt.Sprintf("- %s%s", name, tag)
+	if ws.Name != "" {
+		return ws.Name
+	}
+	return "<unnamed>"
 }
 
 func sortFindings(findings []pkgmgr.Finding) {
