@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"runtime"
 	"sort"
 	"sync"
 
@@ -16,10 +15,16 @@ import (
 	"github.com/robertkasza/deps/internal/triage"
 )
 
+// defaultConcurrency limits parallel pnpm audit calls to keep us under
+// npm's rate limit (per-IP). Most monorepos are well-served by 3; very
+// large ones can raise it via --concurrency.
+const defaultConcurrency = 3
+
 type Options struct {
-	Dir      string
-	Severity string
-	JSON     bool
+	Dir         string
+	Severity    string
+	JSON        bool
+	Concurrency int
 }
 
 func Run(args []string, stdout, stderr io.Writer) error {
@@ -30,6 +35,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.Dir, "dir", ".", "monorepo root (directory containing pnpm-workspace.yaml)")
 	fs.StringVar(&opts.Severity, "severity", "moderate", "minimum severity to report (low|moderate|high|critical)")
 	fs.BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON to stdout")
+	fs.IntVar(&opts.Concurrency, "concurrency", defaultConcurrency, "max workspaces audited in parallel")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -46,7 +52,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 
 	reg := registry.New()
 	planner := plan.New(reg)
-	results := processAll(pm, planner, workspaces, runtime.NumCPU())
+	results := processAll(pm, planner, workspaces, opts.Concurrency)
 
 	rootDir := opts.Dir
 	for _, ws := range workspaces {

@@ -1,51 +1,75 @@
 # deps — Design
 
-Captures the design decisions made before implementation. Update this as decisions change.
+Captures the design decisions for `deps`. Update this as decisions change.
 
 ## Goal
 
-A CLI that scans a pnpm monorepo for npm vulnerabilities and remediates them by editing `package.json` files (workspace bumps, parent bumps, or root-level `pnpm.overrides`), then regenerates the lockfile.
+A CLI that scans a pnpm monorepo for npm vulnerabilities and remediates them by editing `package.json` (workspace bumps, parent bumps, or `pnpm.overrides`), then regenerates the lockfile.
 
 The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, transitive vulns that have no parent fix require `pnpm.overrides`. No free off-the-shelf tool writes those automatically — Renovate silently skips this case, Dependabot doesn't generate pnpm overrides at all.
 
-## Non-goals (for now)
+## Status
+
+### Implemented
+
+- **`deps check`** — discovery, audit per workspace, triage, plan, human + JSON output
+- **`deps fix`** — `check` pipeline + apply edits + `pnpm install --lockfile-only` + scoped re-audit
+- Workspace discovery: parses `pnpm-workspace.yaml` (globs, negation), single-package fallback, `node_modules` exclusion
+- Audit: shells out to `pnpm audit --json` per workspace, attributes findings via path-prefix encoding (`apps__admin>request`)
+- Triage: direct vs transitive based on workspace's `package.json` deps fields; parent identification
+- Plan (SKILL.md ladder): `bump-direct`, `bump-parent` (registry-validated), `override-add`. Distinguishes `major-jump-required` from `no-fix-available`.
+- Apply: sjson-based JSON edits preserving format (key order, indent, trailing newline); yaml.v3 Node-API edits for `pnpm-workspace.yaml`
+- Override target detection: existing `pnpm-workspace.yaml.overrides` wins → existing `package.json.pnpm.overrides` → default to root `package.json` (matches `pnpm audit --fix`)
+- Edit coalescing: `(file, package)` pairs collapse to the highest target version
+- Scoped re-audit per SKILL.md: only edited workspaces unless an override was added
+- Concurrency control: `--concurrency` flag, default 3 (npm rate-limit-friendly)
+- Exit codes: `0` clean · `10` actionable / unresolved present · `20` `unresolved-after-apply` · `1` tool error
+- Tests across all packages with fakes for the runner and registry; real `pnpm audit --json` fixture in `internal/pnpm/testdata/`
+
+### Required, not yet implemented
+
+- **`audit-ci.jsonc` allowlist support.** The target repo (`nhost/nhost`) uses `audit-ci-recursive` whose allowlist must be honored. `deps` should read `audit-ci.jsonc` from the monorepo root and skip any advisory whose GHSA is allowlisted there — both in plan output (don't emit edits for it) and in re-audit verification (don't count as `unresolved-after-apply`). Without this, `deps` will repeatedly try to fix advisories the team has already accepted.
+
+  Format (JSONC):
+  ```jsonc
+  {
+    "moderate": true,
+    "allowlist": ["GHSA-xxxx", "GHSA-yyyy"]
+  }
+  ```
+
+  Implementation sketch:
+  - Read + parse the file once during discovery.
+  - Pass the allowlist into `audit` so filtered findings never reach triage.
+  - Surface allowlisted findings only in a separate "skipped (allowlisted)" line in human output, omitted from JSON entirely (or under `skipped`).
+
+## Non-goals
 
 - Routine non-security updates (Renovate territory).
 - Multiple package managers — pnpm only at first; npm/yarn are future seams.
-- Single-package repos — design supports them trivially (one synthetic workspace), but monorepo is the case we're optimizing for.
-- Automatic ladder retry (if a chosen remediation doesn't actually fix the advisory after install, report it; don't auto-fall-back).
+- Single-package repos as a primary use case (supported, but monorepo is the optimization target).
+- Automatic ladder retry. Failed remediation candidate → reported, not silently swapped for the next rung.
 - In-memory simulation of pnpm's resolver. Post-install re-audit is the ground truth.
-
-## MVP scope
-
-Two commands:
-
-- `deps check` — read-only. Discover workspaces, run `pnpm audit` per workspace, triage findings, plan remediations, emit a report.
-- `deps fix` — `check` + apply edits + `pnpm install --lockfile-only` + re-audit to verify.
-
-Non-interactive throughout. Anything SKILL.md asks a human about (major-version parent bump, ambiguous cases) lands in an `unresolved` list — never auto-decided in MVP. Policy flags can relax this later.
 
 ## Architecture — modular adapters
 
 Three orthogonal concerns separated by interface:
 
 1. **Package manager** (`internal/pkgmgr` interface, `internal/pnpm` impl). Owns: workspace discovery, audit, override-writing, install. Future slots: `internal/npm`, `internal/yarn`.
-2. **Repo layout** (single-package vs monorepo). Handled inside the pkgmgr's `DiscoverWorkspaces` — single-package = one synthetic workspace.
-3. **Remediation logic** (`triage`, `plan`, `registry`). Package-manager-agnostic. Operates on abstract `Advisory`, `Workspace`, `PackageJSON`, `Edit`.
-
-Sketch:
+2. **Repo layout** (single-package vs monorepo). Handled inside the pkgmgr's `DiscoverWorkspaces` — single-package returns one synthetic workspace.
+3. **Remediation logic** (`triage`, `plan`, `registry`). Package-manager-agnostic. Operates on abstract `Advisory`, `Workspace`, `Edit`, `Plan`.
 
 ```go
 type PkgManager interface {
     Name() string
     DiscoverWorkspaces(root string) ([]Workspace, error)
     Audit(ws Workspace) ([]Advisory, error)
-    WriteOverride(rootPkgJSON, pkg, vulnRange, fixedRange string) error
+    ApplyEdits(edits []Edit) error
     Install(root string, lockfileOnly bool) error
 }
 ```
 
-The CLI auto-detects the package manager at startup (`pnpm-lock.yaml` → pnpm). Not a plugin system — no dynamic loading, just clean interfaces in one statically-linked binary.
+The CLI auto-detects the package manager at startup based on lockfile presence. Not a plugin system — clean interfaces in one statically-linked binary.
 
 ## Pipeline
 
@@ -55,19 +79,19 @@ Audit (per workspace)     ← pkgmgr
 triage                    ← generic: direct vs transitive, find top-level parent
 plan                      ← generic: walk SKILL.md ladder, emit Edits
                               (registry-aided for parent-bump candidates)
-─────── check stops here ───────
-apply (write Edits)       ← pkgmgr (writes to package.json)
+─────── deps check stops here ───────
+ApplyEdits (write Edits)  ← pkgmgr (writes to package.json + workspace.yaml)
 Install --lockfile-only   ← pkgmgr
-re-audit                  ← pkgmgr (per-workspace; root-recursive if any override added)
-report                    ← generic
+re-audit                  ← pkgmgr (scoped per SKILL.md; full repo if any override was added)
+report                    ← summary of applied / unresolved / unresolved-after-apply
 ```
 
 ### `triage`
 
 Pure function over an advisory + that workspace's `package.json`. Produces a `Finding`:
 
-- **Direct** if the package is in `dependencies` / `devDependencies`.
-- **Transitive** otherwise; record the top-level parent (first hop after `.` in the advisory's path).
+- **Direct** if the package is in `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies`.
+- **Transitive** otherwise; record the top-level parent (first hop after the workspace prefix in the advisory's path).
 
 No I/O beyond reading the package.json. No remediation decisions.
 
@@ -81,7 +105,7 @@ Walks the SKILL.md ladder per finding and emits candidate `Edit`s (or pushes to 
 | Direct, fix requires major jump | `unresolved{reason: major-jump-required}` |
 | Transitive, parent has fix in current major | `Edit{kind: bump-parent}` |
 | Transitive, only parent-major-bump fixes | `unresolved{reason: major-jump-required}` |
-| Transitive, no parent fix exists | `Edit{kind: override-add}` (or `override-consolidate` if existing root override overlaps) |
+| Transitive, no parent fix exists | `Edit{kind: override-add}` |
 | No fix published anywhere | `unresolved{reason: no-fix-available}` |
 
 Override format (narrow, per SKILL.md):
@@ -90,7 +114,7 @@ Override format (narrow, per SKILL.md):
 "<pkg>@<vulnerable-range>": "<min-fixed-version>"
 ```
 
-`plan` consults the registry to know whether a non-major parent version exists that depends on a fixed version of the vuln package. Best-effort prediction only — see "Validation strategy" below.
+`plan` consults the npm registry (`registry.npmjs.org` by default; respects `.npmrc` `registry=`) to know whether a non-major parent version exists that depends on a fixed version of the vuln package. In-process cache for the lifetime of one run.
 
 ## Validation strategy
 
@@ -106,44 +130,46 @@ write Edits → pnpm install --lockfile-only → pnpm audit --json → check the
 ```
 
 After all fixes:
-- **Per-workspace re-audit** for direct + parent-bump edits (scoped, matches SKILL.md).
-- **Root-level recursive audit** if any `pnpm.overrides` entry was added (overrides are global, matches SKILL.md).
+- **Per-workspace re-audit** for direct + parent-bump edits (scoped, matches SKILL.md). Implemented: only edited workspaces are re-audited.
+- **Full repo re-audit** if any `override-add` was applied (overrides are global).
 
-Any GHSA from the plan still present after install is reported as `unresolved-after-apply`. No automatic ladder retry in MVP.
+Any GHSA from the plan still present after install is reported as `unresolved-after-apply`. No automatic ladder retry — the user reviews and decides.
 
 ## Audit strategy: per-workspace by default
 
-`pnpm audit` (no flags) audits the importer in CWD — root-only if run at the root. Whether that surfaces workspace vulns depends on `node-linker` (hoisted vs isolated) and what's declared in root `package.json`. In the test fixture, root deps + hoisting made root audit "happen to" catch everything. In `nhost/nhost`, root audit finds nothing — workspace audits are required.
+`pnpm audit` (no flags) audits the importer in CWD. Whether it surfaces workspace vulns depends on `node-linker` (hoisted vs isolated) and what's declared in root `package.json`. The behavior is repo-dependent: in our small playground fixture, root audit happens to catch everything (hoisting); in `nhost/nhost`, root audit returns nothing — workspace audits are required.
 
-Building for the per-workspace case is always correct. We can add a fast-path optimization later (`pnpm -r`-style root pass, fall back to per-workspace if attribution is missing).
+Building for the per-workspace case is always correct. There is no safe shortcut to "audit once at root."
+
+Concurrency is bounded (`--concurrency`, default 3) to stay under npm's rate limit.
 
 ## Output and CI-readiness
 
-Deliberate constraints from day one — refactoring these later is annoying:
+Deliberate constraints from day one:
 
-- **Exit codes:** `0` clean · `10` actionable · `20` unresolved · `1` tool error. Stable. CI scripts branch on these.
-- **`--format json` is a contract.** Additive changes only after first release. The future GitHub Action will parse this.
-- **Deterministic output.** Stable key ordering in JSON; sorted advisory lists; no timestamps written into files. Same input → byte-identical output. Otherwise PRs churn for no reason.
-- **stdout vs stderr split.** Structured output → stdout; progress/log → stderr. `deps check --format json > plan.json` must work.
+- **Exit codes:** `0` clean · `10` actionable findings or unresolved present · `20` `unresolved-after-apply` · `1` tool error.
+- **`--json` is a contract.** Additive changes only after first release. The future GitHub Action will parse this.
+- **Deterministic output.** Stable key ordering in JSON; sorted advisory lists; no timestamps written into files. Same input → byte-identical output.
+- **stdout vs stderr split.** Structured output → stdout; progress/log → stderr. `deps check --json > plan.json` works cleanly.
 - **`fix` is a no-op when there's nothing to do.** Exit 0, write nothing, don't touch the lockfile. Prevents CRON runs from opening empty PRs.
+- **No interactive prompts.** Anything SKILL.md asks a human about lands in `unresolved`. Future policy flags will narrow this.
 
-## Future: CI integration (notes, not MVP)
+## Future: CI integration
 
-Eventual goal: a GitHub Action wrapper, run on a schedule, opens PRs with remediations.
+A GitHub Action wrapper, run on a schedule, opens PRs with remediations.
 
-Out of scope for `deps` itself. Lives in a separate repo. The CLI stays git-host-agnostic; the Action knows about GitHub. The constraints above ("Output and CI-readiness") are what make that integration painless when we get to it. No further design decisions needed inside `deps` today.
+Out of scope for `deps` itself. Lives in a separate repo. The CLI stays git-host-agnostic; the Action knows about GitHub. The constraints above ("Output and CI-readiness") make that integration painless when we get to it.
 
 ## MVP simplifications (deliberate)
 
-1. **Single package manager (pnpm).** Interfaces in place for npm/yarn later, but no implementations.
-2. **Single root.** Standard pnpm workspace = exactly one root with `pnpm-workspace.yaml`. `pnpm.overrides` go there.
+1. **Single package manager (pnpm).** Interfaces in place for npm/yarn later.
+2. **Single root.** Standard pnpm workspace = exactly one root with `pnpm-workspace.yaml`.
 3. **No in-memory pnpm resolver.** Post-install audit is the source of truth.
-4. **No automatic ladder retry.** Failed candidate → reported, not silently swapped for the next rung.
+4. **No automatic ladder retry.** Failed candidate → reported, not silently swapped.
 5. **Direct HTTP to `registry.npmjs.org`.** Respect `registry=` in `.npmrc`. No auth handling for private registries yet.
-6. **Non-interactive only.** Major-jump and ambiguous cases land in `unresolved`. Interactive prompts and policy flags (`--max-major-jump`, `--prefer=bump|override`) are future work.
-7. **No `audit-ci.jsonc` allowlist support.** SKILL.md treats it as a last resort; we don't write to it. Later we can read it to skip already-allowlisted advisories.
+6. **No interactive prompts.** Major-jump and ambiguous cases land in `unresolved`. Policy flags (`--max-major-jump`, `--prefer=bump|override`) are future work.
 
-## Project layout (target)
+## Project layout
 
 ```
 cmd/deps/                  entrypoint
@@ -152,23 +178,41 @@ internal/
   checkcmd/                deps check
   fixcmd/                  deps fix
   pkgmgr/                  PkgManager interface + shared types
-  pnpm/                    pnpm adapter (audit, install, write override)
+  pnpm/                    pnpm adapter (audit, install, write override, bump)
   triage/                  direct vs transitive + parent identification
   plan/                    SKILL.md ladder → Edits
-  registry/                npm registry client (HTTP, in-process cache)
-  report/                  JSON / human formatters
+  registry/                npm registry HTTP client + in-process cache
+  report/                  (placeholder) JSON / human formatters
+playground/                hand-built fixtures for manual smoke-testing
 ```
 
-Current scaffold has `workspace/`, `audit/`, `apply/` as separate empty packages — those will fold into `pnpm/` once we restructure to match this target.
+## Polish items (backlog)
+
+Things that work but could be nicer. Each is small, none are blocking.
+
+- **Suppress / collapse pnpm's noisy retry warnings.** `pnpm audit` writes "Will retry in 10 seconds" to stderr on rate-limit. Currently visible to the user; could be filtered.
+- **Real `--severity` filter.** Today the flag filters at display only — plan still walks every finding. Could short-circuit before plan for speed.
+- **Better error messages for missing lockfile.** Currently surfaces pnpm's raw error; could detect and tell the user to run `pnpm install` first.
+- **`internal/report/`** is still a stub. Move the per-formatter logic out of `checkcmd` / `fixcmd` to make the human/JSON outputs reusable across commands.
+- **Display improvements.** Group human output by remediation kind, color severity tags, etc.
+
+## Future features (not yet planned for an MVP+1)
+
+- **`--max-major-jump <N>` / `--allow-major`.** Let users opt into auto-applying major-version bumps that today land in `unresolved{major-jump-required}`.
+- **`--prefer=bump|override`.** When both a parent bump and an override could resolve the vuln, override the default.
+- **Override consolidation.** Today `override-add` always appends; we should detect overlapping ranges and consolidate (e.g., `foo@<1.2.0` + `foo@<1.5.0` → single `foo@<1.5.0`).
+- **npm / yarn adapters.** Slot into `internal/npm/`, `internal/yarn/`. The pkgmgr seam is already in place.
+- **Auth handling for private registries** (e.g., `_authToken=`).
+- **GitHub Action wrapper repo.** Schedule + PR creation; thin wrapper around `deps fix`.
+- **Telemetry / dry-run preview as JSON diff.** A way to show "what would `fix` change" without touching disk, beyond what `check` already shows.
+- **Bundled `pnpm` integration (no shellout).** Speculative; would require reimplementing pnpm's resolver — almost certainly not worth it.
 
 ## Open questions
 
-1. **Naming of the `apply` step.** Currently a method on `PkgManager` (no separate package). Fine to leave.
-2. **What to do when `audit-ci.jsonc` exists** — read it to skip allowlisted advisories, or ignore? (Probably: read it, skip. Later.)
-3. **Concurrency for per-workspace audits.** Parallelize, bounded. Default = NumCPU. Worth measuring before tuning.
-4. **`pnpm install` vs `pnpm install --lockfile-only`.** Lockfile-only is faster and what we want for `fix`'s verification step. But the post-install audit may need `node_modules` present. Confirm during implementation.
-5. **Error handling when `pnpm audit` itself fails** (e.g., registry timeout, malformed lockfile). Should be a tool error (`exit 1`), not silent.
+1. **`audit-ci.jsonc` parse format.** Different versions of `audit-ci` have used different schemas (top-level allowlist vs. per-severity). Need to settle on one or accept both.
+2. **Where to surface allowlisted advisories in output.** Hide entirely, or show under a `skipped` section?
+3. **Should `deps fix` ever update an existing override** when re-audit shows the original range was insufficient? Today it leaves it; SKILL.md says "widen the range or revert."
 
 ## Reference
 
-- `SKILL.md` (in the parent context, gitignored locally) — the prose form of the remediation ladder this tool encodes.
+- `SKILL.md` (in the repo root, gitignored locally) — the prose form of the remediation ladder this tool encodes.
