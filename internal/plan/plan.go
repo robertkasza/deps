@@ -394,10 +394,12 @@ func latestParentInBand(versions []string, anchor *semver.Version, sameMajor boo
 			continue
 		}
 		if sameMajor {
-			if v.Major() != anchor.Major() || !v.GreaterThan(anchor) {
+			vh, vl := caretMajor(v)
+			ah, al := caretMajor(anchor)
+			if vh != ah || vl != al || !v.GreaterThan(anchor) {
 				continue
 			}
-		} else if v.Major() <= anchor.Major() {
+		} else if !caretMajorGreater(v, anchor) {
 			continue
 		}
 		if latest == nil || v.GreaterThan(latest) {

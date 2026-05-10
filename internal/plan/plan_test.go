@@ -214,6 +214,78 @@ func TestBuild_DirectMajorJumpRequired(t *testing.T) {
 	}
 }
 
+// Under npm's caret rule, `^0.24.0` and `^0.25.0` are non-overlapping
+// ranges: `^0.24.0` resolves to `>=0.24.0 <0.25.0`. A 0.x minor bump
+// is therefore an incompatible jump and must surface as
+// major-jump-required, not a silent bump-direct.
+func TestBuild_DirectZeroMajorMinorJumpRequired(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"dependencies": {"foo": "^0.24.0"}}`)
+
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"foo": {"0.24.0", "0.25.0"},
+		},
+	}
+	b := New(reg)
+	plan, err := b.Build([]pkgmgr.Finding{
+		{
+			Kind: pkgmgr.FindingDirect,
+			Advisory: pkgmgr.Advisory{
+				GHSA: "GHSA-x", Package: "foo",
+				FixedRange: ">=0.25.0",
+				Path:       []string{"foo"}, Workspace: ws,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(plan.Actionable) != 0 || len(plan.Unresolved) != 1 {
+		t.Fatalf("plan: %+v", plan)
+	}
+	if plan.Unresolved[0].Reason != ReasonMajorJumpRequired {
+		t.Errorf("reason: %q", plan.Unresolved[0].Reason)
+	}
+}
+
+// A 0.x patch bump stays inside the caret-compatibility band
+// (`^0.24.0` accepts `0.24.5`) and must remain a normal bump-direct.
+func TestBuild_DirectZeroMajorPatchBump(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"dependencies": {"foo": "^0.24.1"}}`)
+
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"foo": {"0.24.1", "0.24.5", "0.25.0"},
+		},
+	}
+	b := New(reg)
+	plan, err := b.Build([]pkgmgr.Finding{
+		{
+			Kind: pkgmgr.FindingDirect,
+			Advisory: pkgmgr.Advisory{
+				GHSA: "GHSA-x", Package: "foo",
+				FixedRange: ">=0.24.5",
+				Path:       []string{"foo"}, Workspace: ws,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(plan.Actionable) != 1 || len(plan.Unresolved) != 0 {
+		t.Fatalf("plan: %+v", plan)
+	}
+	e := plan.Actionable[0]
+	if e.Kind != pkgmgr.EditBumpDirect {
+		t.Errorf("kind: %v", e.Kind)
+	}
+	if e.From != "^0.24.1" || e.To != "^0.24.5" {
+		t.Errorf("from/to: %q -> %q", e.From, e.To)
+	}
+}
+
 func TestBuild_NoFixAvailable(t *testing.T) {
 	dir := t.TempDir()
 	ws := writePkg(t, dir, `{"dependencies": {"request": "^2.88.2"}}`)
@@ -490,6 +562,48 @@ func TestBuild_TransitiveMajorJumpRequired(t *testing.T) {
 				"1.0.0": {Dependencies: map[string]string{"vuln": "1.0.0"}},
 				"1.5.0": {Dependencies: map[string]string{"vuln": "1.0.0"}},
 				"2.0.0": {Dependencies: map[string]string{"vuln": "2.0.0"}},
+			},
+		},
+	}
+	b := New(reg)
+	plan, err := b.Build([]pkgmgr.Finding{
+		{
+			Kind:   pkgmgr.FindingTransitive,
+			Parent: "foo",
+			Advisory: pkgmgr.Advisory{
+				GHSA: "GHSA-w", Package: "vuln",
+				FixedRange: ">=2.0.0",
+				Path:       []string{"foo", "vuln"}, Workspace: ws,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(plan.Actionable) != 0 || len(plan.Unresolved) != 1 {
+		t.Fatalf("plan: %+v", plan)
+	}
+	if plan.Unresolved[0].Reason != ReasonMajorJumpRequired {
+		t.Errorf("reason: %q", plan.Unresolved[0].Reason)
+	}
+}
+
+// Same caret-major rule applies to transitive parent bumps: a 0.x
+// minor jump in the parent crosses an incompatibility boundary and
+// must surface as major-jump-required, not a silent parent bump.
+func TestBuild_TransitiveZeroMajorMinorJumpRequired(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"dependencies": {"foo": "^0.24.0"}}`)
+
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"foo":  {"0.24.0", "0.25.0"},
+			"vuln": {"1.0.0", "2.0.0"},
+		},
+		manifests: map[string]map[string]registry.Manifest{
+			"foo": {
+				"0.24.0": {Dependencies: map[string]string{"vuln": "1.0.0"}},
+				"0.25.0": {Dependencies: map[string]string{"vuln": "2.0.0"}},
 			},
 		},
 	}

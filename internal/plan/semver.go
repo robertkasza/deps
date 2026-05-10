@@ -54,13 +54,41 @@ func extractAnchor(constraint string) *semver.Version {
 	return v
 }
 
+// caretMajor returns the (high, low) pair that npm's `^` operator
+// treats as the incompatible-bump boundary. For 1.x and above, only
+// the major segment matters: `^1.2.3` accepts any `1.x.y`. For 0.x.y,
+// npm caret is stricter — `^0.24.0` accepts only `0.24.x`, so a minor
+// bump (0.24 -> 0.25) is the incompatible boundary.
+//
+// Comparing two versions on this pair answers "are these in the same
+// caret-compatibility band?" — which is what the planner needs when
+// deciding bump-direct vs major-jump-required.
+func caretMajor(v *semver.Version) (uint64, uint64) {
+	if v.Major() == 0 {
+		return 0, v.Minor()
+	}
+	return v.Major(), 0
+}
+
+// caretMajorGreater reports whether v's caret-major band is strictly
+// above anchor's. Compares lexicographically on the (high, low) pair.
+func caretMajorGreater(v, anchor *semver.Version) bool {
+	vh, vl := caretMajor(v)
+	ah, al := caretMajor(anchor)
+	if vh != ah {
+		return vh > ah
+	}
+	return vl > al
+}
+
 // pickSmallest returns the smallest version in versions that:
 //   - satisfies fixed (the advisory's patched_versions range),
-//   - shares its major with anchor (the workspace's current pin),
+//   - shares its caret-major band with anchor (the workspace's current pin),
 //   - is strictly greater than anchor.
 //
 // Returns (nil, false) if none qualifies.
 func pickSmallest(versions []string, fixed *semver.Constraints, anchor *semver.Version) (*semver.Version, bool) {
+	anchorH, anchorL := caretMajor(anchor)
 	var candidates []*semver.Version
 	for _, raw := range versions {
 		v, err := semver.NewVersion(raw)
@@ -73,7 +101,8 @@ func pickSmallest(versions []string, fixed *semver.Constraints, anchor *semver.V
 		if !fixed.Check(v) {
 			continue
 		}
-		if v.Major() != anchor.Major() {
+		vh, vl := caretMajor(v)
+		if vh != anchorH || vl != anchorL {
 			continue
 		}
 		if !v.GreaterThan(anchor) {
@@ -89,9 +118,9 @@ func pickSmallest(versions []string, fixed *semver.Constraints, anchor *semver.V
 }
 
 // hasMajorBumpFix returns true if any version in versions satisfies
-// fixed AND has a major number greater than anchor's major. Indicates
-// "fix exists but only in a new major" — used to distinguish
-// major-jump-required from no-fix-available.
+// fixed AND lives in a caret-major band strictly above anchor's.
+// Indicates "fix exists but only across an incompatible boundary" —
+// used to distinguish major-jump-required from no-fix-available.
 func hasMajorBumpFix(versions []string, fixed *semver.Constraints, anchor *semver.Version) bool {
 	for _, raw := range versions {
 		v, err := semver.NewVersion(raw)
@@ -104,7 +133,7 @@ func hasMajorBumpFix(versions []string, fixed *semver.Constraints, anchor *semve
 		if !fixed.Check(v) {
 			continue
 		}
-		if v.Major() > anchor.Major() {
+		if caretMajorGreater(v, anchor) {
 			return true
 		}
 	}
