@@ -1,6 +1,10 @@
 package checkcmd
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/robertkasza/deps/internal/pkgmgr"
+)
 
 // Exit-code contract for `deps check`:
 //   0  clean
@@ -40,5 +44,62 @@ func TestDecideExit(t *testing.T) {
 				t.Fatalf("check must never return code 20; that is reserved for fix")
 			}
 		})
+	}
+}
+
+// `--severity` filters display, JSON, summary and exit code together.
+// Regression: previously summarize ran on the unfiltered plan, so
+// `deps check --severity critical` could exit 10 while showing zero
+// findings. The fix routes everything through filterResultsBySeverity
+// before summarize.
+func TestSeverityFilterDrivesExitCode(t *testing.T) {
+	ws := pkgmgr.Workspace{
+		Dir:         "/repo/apps/admin",
+		RelDir:      "apps/admin",
+		PackageJSON: "/repo/apps/admin/package.json",
+		Name:        "admin",
+	}
+	moderate := pkgmgr.Advisory{
+		GHSA:      "GHSA-moderate",
+		Severity:  pkgmgr.SeverityModerate,
+		Package:   "lodash",
+		Workspace: ws,
+	}
+	finding := pkgmgr.Finding{Advisory: moderate, Kind: pkgmgr.FindingDirect}
+	results := []WorkspaceResult{{
+		Workspace: ws,
+		Findings:  []pkgmgr.Finding{finding},
+		Plan: pkgmgr.Plan{
+			Actionable: []pkgmgr.Edit{{
+				Kind:    pkgmgr.EditBumpDirect,
+				File:    ws.PackageJSON,
+				Package: "lodash",
+				Field:   "dependencies",
+				From:    "^4.17.20",
+				To:      "^4.17.21",
+			}},
+			Unresolved: []pkgmgr.Unresolved{{Finding: finding, Reason: "no-fix"}},
+		},
+	}}
+
+	// Sanity: at moderate threshold, both rows survive and check exits 10.
+	atModerate := filterResultsBySeverity(results, minSeverity("moderate"))
+	a, u, f := summarize(atModerate)
+	if a != 1 || u != 1 || f != 0 {
+		t.Fatalf("moderate threshold: want 1/1/0, got %d/%d/%d", a, u, f)
+	}
+	if err := decideExit(a, u, f); err == nil || err.(exitErr).Code() != 10 {
+		t.Fatalf("moderate threshold: want exit 10, got %v", err)
+	}
+
+	// Bug repro: at critical threshold, no rows survive, so summary
+	// must read 0/0/0 and exit must be 0 (not 10).
+	atCritical := filterResultsBySeverity(results, minSeverity("critical"))
+	a, u, f = summarize(atCritical)
+	if a != 0 || u != 0 || f != 0 {
+		t.Fatalf("critical threshold: want 0/0/0, got %d/%d/%d", a, u, f)
+	}
+	if err := decideExit(a, u, f); err != nil {
+		t.Fatalf("critical threshold: want nil exit, got %v", err)
 	}
 }

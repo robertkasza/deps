@@ -65,17 +65,23 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
+	// Apply --severity once, here. summarize/exit-code, the stderr summary
+	// line, stdout text and JSON output must all agree on the same set of
+	// findings — otherwise `deps check --severity critical` on a moderate-
+	// only plan can show "no findings" while still exiting 10.
+	results = filterResultsBySeverity(results, minSeverity(opts.Severity))
+
 	totalActionable, totalUnresolved, failedCount := summarize(results)
 	fmt.Fprintf(stderr,
 		"checked %d workspace(s) under %s: %d actionable, %d unresolved, %d failure(s)\n",
 		len(results), rootDir, totalActionable, totalUnresolved, failedCount)
 
 	if opts.JSON {
-		if err := writeJSON(stdout, rootDir, results, minSeverity(opts.Severity)); err != nil {
+		if err := writeJSON(stdout, rootDir, results); err != nil {
 			return err
 		}
 	} else {
-		printResults(stdout, results, minSeverity(opts.Severity))
+		printResults(stdout, results)
 	}
 
 	return decideExit(totalActionable, totalUnresolved, failedCount)
@@ -156,7 +162,7 @@ type jsonSummary struct {
 	Failures   int `json:"failures"`
 }
 
-func writeJSON(w io.Writer, root string, results []WorkspaceResult, minSev int) error {
+func writeJSON(w io.Writer, root string, results []WorkspaceResult) error {
 	out := jsonOutput{
 		Root:       root,
 		Workspaces: make([]jsonWorkspace, 0, len(results)),
@@ -174,9 +180,7 @@ func writeJSON(w io.Writer, root string, results []WorkspaceResult, minSev int) 
 			jw.Error = r.Err.Error()
 			out.Summary.Failures++
 		} else {
-			actionable := filterEditsBySeverity(r.Plan.Actionable, r.Findings, minSev)
-			unresolved := filterUnresolvedBySeverity(r.Plan.Unresolved, minSev)
-			for _, e := range actionable {
+			for _, e := range r.Plan.Actionable {
 				jw.Actionable = append(jw.Actionable, jsonEdit{
 					Kind:            string(e.Kind),
 					File:            e.File,
@@ -188,7 +192,7 @@ func writeJSON(w io.Writer, root string, results []WorkspaceResult, minSev int) 
 					Reason:          e.Reason,
 				})
 			}
-			for _, u := range unresolved {
+			for _, u := range r.Plan.Unresolved {
 				jw.Unresolved = append(jw.Unresolved, jsonUnresolved{
 					GHSA:     u.Finding.Advisory.GHSA,
 					Package:  u.Finding.Advisory.Package,
@@ -299,15 +303,15 @@ func summarize(results []WorkspaceResult) (actionable, unresolved, failed int) {
 	return
 }
 
-func printResults(w io.Writer, results []WorkspaceResult, minSev int) {
+func printResults(w io.Writer, results []WorkspaceResult) {
 	for _, r := range results {
 		header := workspaceHeader(r.Workspace)
 		if r.Err != nil {
 			fmt.Fprintf(w, "%s  [failed: %v]\n", header, r.Err)
 			continue
 		}
-		actionable := filterEditsBySeverity(r.Plan.Actionable, r.Findings, minSev)
-		unresolved := filterUnresolvedBySeverity(r.Plan.Unresolved, minSev)
+		actionable := r.Plan.Actionable
+		unresolved := r.Plan.Unresolved
 		if len(actionable) == 0 && len(unresolved) == 0 {
 			fmt.Fprintf(w, "%s  no findings\n", header)
 			continue
@@ -434,6 +438,23 @@ func mostRelevantSeverity(e pkgmgr.Edit, findings []pkgmgr.Finding) pkgmgr.Sever
 		return pkgmgr.SeverityCritical
 	}
 	return highest
+}
+
+// filterResultsBySeverity returns a copy of results with each Plan's
+// Actionable/Unresolved narrowed to entries meeting min severity.
+// Failed workspaces (Err != nil) are passed through unchanged so they
+// still count toward the failure exit code.
+func filterResultsBySeverity(results []WorkspaceResult, min int) []WorkspaceResult {
+	out := make([]WorkspaceResult, len(results))
+	for i, r := range results {
+		out[i] = r
+		if r.Err != nil {
+			continue
+		}
+		out[i].Plan.Actionable = filterEditsBySeverity(r.Plan.Actionable, r.Findings, min)
+		out[i].Plan.Unresolved = filterUnresolvedBySeverity(r.Plan.Unresolved, min)
+	}
+	return out
 }
 
 func filterUnresolvedBySeverity(items []pkgmgr.Unresolved, min int) []pkgmgr.Unresolved {
