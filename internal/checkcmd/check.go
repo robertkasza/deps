@@ -78,13 +78,18 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		printResults(stdout, results, minSeverity(opts.Severity))
 	}
 
-	// Exit code precedence: tool error > unresolved > actionable > clean.
+	return decideExit(totalActionable, totalUnresolved, failedCount)
+}
+
+// decideExit maps per-workspace counts to the check command's exit
+// code contract: tool error > findings present > clean. Code 20
+// (`unresolved-after-apply`) is reserved for `fix` and is never
+// returned by `check`.
+func decideExit(actionable, unresolved, failed int) error {
 	switch {
-	case failedCount > 0:
-		return exitErr{code: 1, msg: fmt.Sprintf("%d workspace(s) failed", failedCount)}
-	case totalUnresolved > 0:
-		return exitErr{code: 20}
-	case totalActionable > 0:
+	case failed > 0:
+		return exitErr{code: 1, msg: fmt.Sprintf("%d workspace(s) failed", failed)}
+	case actionable > 0 || unresolved > 0:
 		return exitErr{code: 10}
 	}
 	return nil
