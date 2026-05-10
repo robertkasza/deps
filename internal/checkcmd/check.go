@@ -396,24 +396,29 @@ func filterEditsBySeverity(edits []pkgmgr.Edit, findings []pkgmgr.Finding, min i
 }
 
 // mostRelevantSeverity finds the highest-severity finding associated
-// with an edit (matched by Package + File). Falls back to Critical so
-// the edit isn't filtered out by accident.
+// with an edit. Bump edits are scoped to a specific workspace's
+// package.json so we match by file. Override edits live at the
+// monorepo root and apply globally — match any finding on that vuln
+// package across the run. Falls back to Critical so the edit isn't
+// filtered out by accident.
 func mostRelevantSeverity(e pkgmgr.Edit, findings []pkgmgr.Finding) pkgmgr.Severity {
 	highest := pkgmgr.SeverityLow
 	matched := false
 	for _, f := range findings {
-		if f.Advisory.Workspace.PackageJSON != e.File {
-			continue
-		}
-		// For bump-direct, edit.Package == advisory.Package.
-		// For bump-parent, edit.Package is the parent; we match by parent.
-		// For override-add, edit.Package == advisory.Package.
-		if e.Kind == pkgmgr.EditBumpParent {
-			if f.Parent != e.Package {
+		switch e.Kind {
+		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate:
+			// Override is root-scoped; ignore the workspace and match by vuln package.
+			if f.Advisory.Package != e.Package {
 				continue
 			}
-		} else if f.Advisory.Package != e.Package {
-			continue
+		case pkgmgr.EditBumpParent:
+			if f.Advisory.Workspace.PackageJSON != e.File || f.Parent != e.Package {
+				continue
+			}
+		default:
+			if f.Advisory.Workspace.PackageJSON != e.File || f.Advisory.Package != e.Package {
+				continue
+			}
 		}
 		if severityRank[f.Advisory.Severity] >= severityRank[highest] {
 			highest = f.Advisory.Severity

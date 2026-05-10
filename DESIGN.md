@@ -18,9 +18,9 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - Audit: shells out to `pnpm audit --json` per workspace, attributes findings via path-prefix encoding (`apps__admin>request`)
 - Triage: direct vs transitive based on workspace's `package.json` deps fields; parent identification
 - Plan (SKILL.md ladder): `bump-direct`, `bump-parent` (registry-validated), `override-add`. Distinguishes `major-jump-required` from `no-fix-available`.
-- Apply: sjson-based JSON edits preserving format (key order, indent, trailing newline); yaml.v3 Node-API edits for `pnpm-workspace.yaml`
+- **Multi-advisory grouping.** Findings are grouped by `(workspace, package)` for direct deps and `(workspace, parent, vuln pkg)` for transitive deps before the ladder runs. One bump or override per group covers every advisory it can; overrides are merged across the workspace's vuln pkg (broadest vulnerable range, highest fixed target). Within a transitive group, a parent bump is preferred for any advisory it patches even when an override is also needed for a sibling advisory — overrides are sticky tech debt and we never use one when a parent bump would do.
+- Apply: sjson-based JSON edits preserving format (key order, indent, trailing newline); yaml.v3 Node-API edits for `pnpm-workspace.yaml`. The applier is a flat writer — all grouping/dedup is the planner's responsibility.
 - Override target detection: existing `pnpm-workspace.yaml.overrides` wins → existing `package.json.pnpm.overrides` → default to root `package.json` (matches `pnpm audit --fix`)
-- Edit coalescing: `(file, package)` pairs collapse to the highest target version
 - Scoped re-audit per SKILL.md: only edited workspaces unless an override was added
 - Concurrency control: `--concurrency` flag, default 3 (npm rate-limit-friendly)
 - Exit codes: `0` clean · `10` actionable / unresolved present · `20` `unresolved-after-apply` · `1` tool error
@@ -97,15 +97,22 @@ No I/O beyond reading the package.json. No remediation decisions.
 
 ### `plan`
 
-Walks the SKILL.md ladder per finding and emits candidate `Edit`s (or pushes to `unresolved`).
+Groups findings, then walks the SKILL.md ladder per advisory within each group, emitting candidate `Edit`s (or pushing to `unresolved`).
 
-| Finding | Plan output |
+**Grouping keys:**
+- Direct findings: `(workspace, package)`. One `bump-direct` per group, target version = `pickSmallest` against the *intersection* of every group member's `FixedRange`.
+- Transitive findings: `(workspace, parent, vuln pkg)`. The latest same-major parent's predicted vuln resolution is computed once; each advisory is checked against that prediction. Advisories the prediction clears collapse into a single `bump-parent`; the rest fall to override.
+- Override edits are then merged across `(monorepoRoot, vuln pkg)` — broadest vulnerable range, highest fixed target — so `pnpm.overrides` stays minimal.
+
+**Per-advisory ladder within a group:**
+
+| Advisory shape | Plan output |
 |---|---|
-| Direct, fix in same major | `Edit{kind: bump-direct}` |
-| Direct, fix requires major jump | `unresolved{reason: major-jump-required}` |
-| Transitive, parent has fix in current major | `Edit{kind: bump-parent}` |
-| Transitive, only parent-major-bump fixes | `unresolved{reason: major-jump-required}` |
-| Transitive, no parent fix exists | `Edit{kind: override-add}` |
+| Direct, fix in same major | participates in the group's `bump-direct` |
+| Direct, fix requires major jump | `unresolved{reason: major-jump-required}` (group still bumps for the others) |
+| Transitive, latest same-major parent's predicted resolution clears it | participates in the group's `bump-parent` |
+| Transitive, only newer-major parent's predicted resolution clears it | `unresolved{reason: major-jump-required}` |
+| Transitive, no parent version's predicted resolution clears it | contributes to an `override-add` (merged across the workspace's vuln pkg) |
 | No fix published anywhere | `unresolved{reason: no-fix-available}` |
 
 Override format (narrow, per SKILL.md):
@@ -190,7 +197,6 @@ playground/                hand-built fixtures for manual smoke-testing
 
 Things that work but could be nicer. Each is small, none are blocking.
 
-- **Show post-coalesce edit count up front in `fix`.** Today the flow reads `plan: 6 actionable finding(s)` → `applying 6 candidate edit(s)` → `1 edit(s) applied`. The user has to infer "coalesce happened" from the drop. A real fix would expose a `PkgManager.PreviewApply(edits) []Edit` (or similar) and print `applying 1 edit(s) (from 6 candidates)` instead. The current wording is workable but the lie-by-omission was only patched, not fixed.
 - **`deps version` command (or `--version` flag).** Prints the binary's version, build commit, Go version. Use `runtime/debug.ReadBuildInfo` so it works for both `go install` and `go build`. Add a stable VCS stamp via `-ldflags "-X main.version=..."` for release builds.
 - **Suppress / collapse pnpm's noisy retry warnings.** `pnpm audit` writes "Will retry in 10 seconds" to stderr on rate-limit. Currently visible to the user; could be filtered.
 - **Real `--severity` filter.** Today the flag filters at display only — plan still walks every finding. Could short-circuit before plan for speed.

@@ -4,163 +4,36 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/Masterminds/semver/v3"
-
 	"github.com/robertkasza/deps/internal/pkgmgr"
 )
 
-// ApplyEdits writes a slice of edits to disk and returns the edits
-// that were actually applied (post-coalesce).
+// ApplyEdits writes each edit to disk in order and returns the edits
+// that were applied. Override edits are routed by writeOverride to the
+// appropriate pnpm-workspace.yaml or root package.json based on
+// existing config.
 //
-// Edits are coalesced per (file, package) — when multiple edits target
-// the same dependency, the highest "To" version wins. Override edits
-// for the same (file, package) are merged into one with the broadest
-// vulnerable range and the highest fixed target.
-//
-// Override edits are routed by writeOverride to the appropriate
-// pnpm-workspace.yaml or root package.json based on existing config.
-//
-// On the first write error, ApplyEdits returns whatever it managed to
-// apply so far in the returned slice along with the error. Earlier
-// successful writes stay on disk.
+// The planner is responsible for emitting one edit per
+// (file, package); ApplyEdits does no grouping or merging. On the
+// first write error, ApplyEdits returns whatever it managed to apply
+// so far along with the error — earlier successful writes stay on
+// disk.
 func (a *Adapter) ApplyEdits(edits []pkgmgr.Edit) ([]pkgmgr.Edit, error) {
-	bumps, overrides, err := groupAndCoalesce(edits)
-	if err != nil {
-		return nil, err
-	}
-	applied := make([]pkgmgr.Edit, 0, len(bumps)+len(overrides))
-	for _, b := range bumps {
-		if err := writeBump(b.File, b.Field, b.Package, b.To); err != nil {
-			return applied, fmt.Errorf("apply bump %s: %w", b.Package, err)
-		}
-		applied = append(applied, b)
-	}
-	for _, o := range overrides {
-		root := filepath.Dir(o.File)
-		if _, err := writeOverride(root, o.Package, o.VulnerableRange, o.To); err != nil {
-			return applied, fmt.Errorf("apply override %s: %w", o.Package, err)
-		}
-		applied = append(applied, o)
-	}
-	return applied, nil
-}
-
-// groupAndCoalesce splits edits into bumps and overrides, dedupes
-// (file, package) bumps by picking the highest target version, and
-// dedupes (root, package, vulnRange) overrides identically.
-func groupAndCoalesce(edits []pkgmgr.Edit) (bumps, overrides []pkgmgr.Edit, err error) {
-	bumpByKey := map[string]pkgmgr.Edit{}
-	overrideByKey := map[string]pkgmgr.Edit{}
-
+	applied := make([]pkgmgr.Edit, 0, len(edits))
 	for _, e := range edits {
 		switch e.Kind {
 		case pkgmgr.EditBumpDirect, pkgmgr.EditBumpParent:
-			key := e.File + "\x00" + e.Package
-			cur, ok := bumpByKey[key]
-			if !ok {
-				bumpByKey[key] = e
-				continue
-			}
-			win, err := higherTarget(cur.To, e.To)
-			if err != nil {
-				return nil, nil, err
-			}
-			if win == e.To {
-				bumpByKey[key] = e
+			if err := writeBump(e.File, e.Field, e.Package, e.To); err != nil {
+				return applied, fmt.Errorf("apply bump %s: %w", e.Package, err)
 			}
 		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate:
-			// Consolidate per (file, package): multiple GHSAs for the
-			// same package produce multiple override edits with
-			// overlapping vulnerable ranges. We pick the broadest
-			// vulnerable range and the highest fixed target — one
-			// merged entry that covers all of them.
-			key := e.File + "\x00" + e.Package
-			cur, ok := overrideByKey[key]
-			if !ok {
-				overrideByKey[key] = e
-				continue
+			root := filepath.Dir(e.File)
+			if _, err := writeOverride(root, e.Package, e.VulnerableRange, e.To); err != nil {
+				return applied, fmt.Errorf("apply override %s: %w", e.Package, err)
 			}
-			merged := cur
-			if broaderRange(cur.VulnerableRange, e.VulnerableRange) == e.VulnerableRange {
-				merged.VulnerableRange = e.VulnerableRange
-			}
-			win, err := higherTarget(cur.To, e.To)
-			if err != nil {
-				return nil, nil, err
-			}
-			if win == e.To {
-				merged.To = e.To
-			}
-			overrideByKey[key] = merged
 		default:
-			return nil, nil, fmt.Errorf("unknown edit kind %q", e.Kind)
+			return applied, fmt.Errorf("unknown edit kind %q", e.Kind)
 		}
+		applied = append(applied, e)
 	}
-	for _, b := range bumpByKey {
-		bumps = append(bumps, b)
-	}
-	for _, o := range overrideByKey {
-		overrides = append(overrides, o)
-	}
-	return bumps, overrides, nil
-}
-
-// higherTarget returns whichever of a,b represents a higher version
-// constraint (used by the coalescer). Both inputs are constraint
-// strings like "^4.17.21" or ">=4.17.21". The version embedded in
-// each is compared; the constraint string for the larger version is
-// returned.
-func higherTarget(a, b string) (string, error) {
-	av := versionInConstraint(a)
-	bv := versionInConstraint(b)
-	if av == nil && bv == nil {
-		return a, nil
-	}
-	if av == nil {
-		return b, nil
-	}
-	if bv == nil {
-		return a, nil
-	}
-	if bv.GreaterThan(av) {
-		return b, nil
-	}
-	return a, nil
-}
-
-// broaderRange returns whichever of a, b is the broader vulnerable
-// range — the one whose embedded version has the higher upper bound.
-// "<3.1.2" is broader than "<3.1.0"; "<=3.1.1" is broader than "<3.1.0".
-// On parse failure for either, returns a unchanged.
-func broaderRange(a, b string) string {
-	av := versionInConstraint(a)
-	bv := versionInConstraint(b)
-	if av == nil {
-		return b
-	}
-	if bv == nil {
-		return a
-	}
-	if bv.GreaterThan(av) {
-		return b
-	}
-	return a
-}
-
-// versionInConstraint returns the embedded version of a single-version
-// constraint ("^4.17.21" -> 4.17.21). Returns nil for compound or
-// unparseable constraints.
-func versionInConstraint(s string) *semver.Version {
-	t := s
-	for _, p := range []string{"^", "~", ">=", "<=", ">", "<", "="} {
-		if len(t) >= len(p) && t[:len(p)] == p {
-			t = t[len(p):]
-			break
-		}
-	}
-	v, err := semver.NewVersion(t)
-	if err != nil {
-		return nil
-	}
-	return v
+	return applied, nil
 }

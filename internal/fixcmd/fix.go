@@ -313,6 +313,10 @@ func flatten(results []WorkspaceResult) (
 			}
 		}
 	}
+	// Overrides target the monorepo root, so multiple workspaces all
+	// emitting an override for the same vuln pkg must collapse to one
+	// entry. Per-workspace mergeOverrides inside Build can't see this.
+	edits = pkgmgr.MergeOverrides(edits)
 	return edits, targetedGHSAs, editedWorkspaces, hasOverride
 }
 
