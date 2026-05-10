@@ -190,6 +190,7 @@ playground/                hand-built fixtures for manual smoke-testing
 
 Things that work but could be nicer. Each is small, none are blocking.
 
+- **Show post-coalesce edit count up front in `fix`.** Today the flow reads `plan: 6 actionable finding(s)` → `applying 6 candidate edit(s)` → `1 edit(s) applied`. The user has to infer "coalesce happened" from the drop. A real fix would expose a `PkgManager.PreviewApply(edits) []Edit` (or similar) and print `applying 1 edit(s) (from 6 candidates)` instead. The current wording is workable but the lie-by-omission was only patched, not fixed.
 - **`deps version` command (or `--version` flag).** Prints the binary's version, build commit, Go version. Use `runtime/debug.ReadBuildInfo` so it works for both `go install` and `go build`. Add a stable VCS stamp via `-ldflags "-X main.version=..."` for release builds.
 - **Suppress / collapse pnpm's noisy retry warnings.** `pnpm audit` writes "Will retry in 10 seconds" to stderr on rate-limit. Currently visible to the user; could be filtered.
 - **Real `--severity` filter.** Today the flag filters at display only — plan still walks every finding. Could short-circuit before plan for speed.
@@ -218,6 +219,22 @@ Things that work but could be nicer. Each is small, none are blocking.
 1. **`audit-ci.jsonc` parse format.** Different versions of `audit-ci` have used different schemas (top-level allowlist vs. per-severity). Need to settle on one or accept both.
 2. **Where to surface allowlisted advisories in output.** Hide entirely, or show under a `skipped` section?
 3. **Should `deps fix` ever update an existing override** when re-audit shows the original range was insufficient? Today it leaves it; SKILL.md says "widen the range or revert."
+
+## Cleanup before calling it 1.0
+
+A code-quality pass we owe ourselves before treating this as done. Each is a real, identified issue; none are blocking the tool from working.
+
+- **`internal/report/` is a stub.** Output-formatting logic lives inside `checkcmd` and `fixcmd`, duplicated between them. Move both human and JSON formatters into `internal/report/` so each command writes a single line of "format this Plan + WorkspaceResults" and the code path is shared.
+- **`processAll` is duplicated in `checkcmd` and `fixcmd`.** Near-identical bodies (audit → triage → plan per workspace, bounded concurrency, progress reporting). Extract to one place — likely `internal/pipeline/` — once the API is stable. Was reasonable while we were iterating; less so now that both copies have drifted only by what they wrap around.
+- **0.x semver handling is naive.** We use `Major()` from `Masterminds/semver/v3`, which returns `0` for every 0.x version. npm semver treats the minor as the breaking line for `0.x.y` — so `^0.24.0` and `^0.25.0` are *not* compatible, but our same-major check thinks they are. Real packages pin pre-1.0 deps; we'll miscategorize parent-major-bump cases on those today.
+- **No real integration test against pnpm.** All tests use fakes. When pnpm changes its audit JSON or override semantics, we won't notice until a real run breaks. A skip-by-default test that runs `pnpm audit` on `playground/vuln-test` would catch regressions cheaply.
+- **Inconsistent error message style.** Some surface as `deps: <wrap>: <inner>` (multi-level wrapping), some as flat strings. Not bad; not deliberate either. Worth a pass to settle on one shape.
+
+## Things to watch
+
+Bugs we noticed but haven't reproduced cleanly. Keep an eye out.
+
+- **Key reordering on `writeBump`.** During an nhost run, `services/functions/package.json` showed an unexpected key reorder around an `esbuild` bump (`@jest/globals` moved up, `esbuild` moved down). `sjson.SetBytes` shouldn't reorder existing keys — if this happens again, capture the before/after file contents and the exact `Edit` we passed in, and dig into whether sjson is at fault or whether something else (an interaction with another edit on the same file?) is reformatting.
 
 ## Reference
 
