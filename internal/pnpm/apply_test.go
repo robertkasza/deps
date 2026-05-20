@@ -61,10 +61,10 @@ func TestApplyEdits_OverrideAdd(t *testing.T) {
 	}
 }
 
-func TestInstall_LockfileOnly(t *testing.T) {
+func TestInstall(t *testing.T) {
 	runner, inv := fakeRunner([]byte("ok"), nil, 0, nil)
 	a := New().WithRunner(runner)
-	if err := a.Install("/some/root", true); err != nil {
+	if err := a.Install("/some/root"); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	if inv.Dir != "/some/root" {
@@ -72,18 +72,6 @@ func TestInstall_LockfileOnly(t *testing.T) {
 	}
 	if inv.Name != "pnpm" {
 		t.Errorf("cmd: %q", inv.Name)
-	}
-	want := []string{"install", "--lockfile-only"}
-	if len(inv.Args) != 2 || inv.Args[0] != want[0] || inv.Args[1] != want[1] {
-		t.Errorf("args: %v, want %v", inv.Args, want)
-	}
-}
-
-func TestInstall_FullInstall(t *testing.T) {
-	runner, inv := fakeRunner(nil, nil, 0, nil)
-	a := New().WithRunner(runner)
-	if err := a.Install("/some/root", false); err != nil {
-		t.Fatalf("Install: %v", err)
 	}
 	if len(inv.Args) != 1 || inv.Args[0] != "install" {
 		t.Errorf("args: %v, want [install]", inv.Args)
@@ -93,7 +81,7 @@ func TestInstall_FullInstall(t *testing.T) {
 func TestInstall_NonZeroExit(t *testing.T) {
 	runner, _ := fakeRunner(nil, []byte("registry timeout"), 1, nil)
 	a := New().WithRunner(runner)
-	err := a.Install("/x", true)
+	err := a.Install("/x")
 	if err == nil {
 		t.Fatalf("expected error on non-zero exit")
 	}

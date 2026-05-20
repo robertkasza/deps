@@ -13,7 +13,7 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 ### Implemented
 
 - **`deps check`** — discovery, audit per workspace, triage, plan, human + JSON output
-- **`deps fix`** — `check` pipeline + apply edits + `pnpm install --lockfile-only` + scoped re-audit
+- **`deps fix`** — `check` pipeline + apply edits + `pnpm install` + scoped re-audit
 - Workspace discovery: parses `pnpm-workspace.yaml` (globs, negation), single-package fallback, `node_modules` exclusion
 - Audit: shells out to `pnpm audit --json` per workspace, attributes findings via path-prefix encoding (`apps__admin>request`)
 - Triage: direct vs transitive based on workspace's `package.json` deps fields; parent identification
@@ -42,6 +42,23 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
   - Read + parse the file once during discovery.
   - Pass the allowlist into `audit` so filtered findings never reach triage.
   - Surface allowlisted findings only in a separate "skipped (allowlisted)" line in human output, omitted from JSON entirely (or under `skipped`).
+
+- **`lockfile-refresh` edit kind.** A fourth rung at the top of the SKILL.md ladder for transitive findings where the *currently declared* dependency range in some workspace already admits a non-vulnerable version — the lockfile just has a stale resolution. Reference case: [nhost/nhost#4306](https://github.com/nhost/nhost/pull/4306), where `brace-expansion@5.0.5` was resolved under a `^5.0.5` range and `5.0.6` (a patch release) fixed the advisory. The PR touched only `pnpm-lock.yaml` files — zero `package.json` churn, no sticky override, no `pnpm.overrides` to remove later. We currently miss this and fall through to `bump-parent` or `override-add` unnecessarily.
+
+  Detection (inside the transitive group, before the existing ladder runs):
+  - For each advisory, walk the dep graph the audit already produced and find every declared range that resolves to the vulnerable package (parent → vuln pkg, grandparent → parent, etc., until the root range).
+  - If any version in the advisory's `fixedIn` set satisfies the *unchanged* declared range, the lockfile alone can carry the fix. Emit `Edit{Kind: LockfileRefresh, Package: <vuln pkg>}` and skip the rest of the ladder for this finding.
+  - The check is purely semver math against data we already have — no extra registry calls.
+
+  Apply: no `package.json` write. The applier records the package name; `fix.go` aggregates these across the run and, after the existing `pnpm install` phase, issues `pnpm update <pkg> -r` (one invocation per affected package) at the monorepo root. `pnpm update -r` re-resolves a single transitive within its existing semver ranges across all workspaces and writes the result to the lockfile.
+
+  Ordering note: `lockfile-refresh` must run *before* any `override-add` is considered for the same vuln pkg, otherwise we'd write a sticky override for a problem the existing range could have absorbed. Slot it as the new top of the ladder for transitives:
+
+  | Transitive, declared range already admits a fix | `lockfile-refresh` |
+
+  Re-audit scope: `lockfile-refresh` is repo-global like `override-add` (it can shift resolutions in workspaces we didn't visit), so its presence should force the full-repo re-audit branch in `fix.go`.
+
+  JSON output: new entry under `edits[].kind = "lockfile-refresh"` with just `{kind, package, fromVersion, toVersion?}`. Additive — no rename of existing fields. New exit-code paths are not needed.
 
 ## Non-goals
 
@@ -81,7 +98,7 @@ plan                      ← generic: walk SKILL.md ladder, emit Edits
                               (registry-aided for parent-bump candidates)
 ─────── deps check stops here ───────
 ApplyEdits (write Edits)  ← pkgmgr (writes to package.json + workspace.yaml)
-Install --lockfile-only   ← pkgmgr
+Install                   ← pkgmgr (pnpm install)
 re-audit                  ← pkgmgr (scoped per SKILL.md; full repo if any override was added)
 report                    ← summary of applied / unresolved / unresolved-after-apply
 ```
@@ -133,7 +150,7 @@ Override format (narrow, per SKILL.md):
 The authoritative check is **post-install re-audit**:
 
 ```
-write Edits → pnpm install --lockfile-only → pnpm audit --json → check the GHSA is gone
+write Edits → pnpm install → pnpm audit --json → check the GHSA is gone
 ```
 
 After all fixes:
@@ -240,7 +257,15 @@ A code-quality pass we owe ourselves before treating this as done. Each is a rea
 
 Bugs we noticed but haven't reproduced cleanly. Keep an eye out.
 
-- **Key reordering on `writeBump`.** During an nhost run, `services/functions/package.json` showed an unexpected key reorder around an `esbuild` bump (`@jest/globals` moved up, `esbuild` moved down). `sjson.SetBytes` shouldn't reorder existing keys — if this happens again, capture the before/after file contents and the exact `Edit` we passed in, and dig into whether sjson is at fault or whether something else (an interaction with another edit on the same file?) is reformatting.
+- ~~**Key reordering on `writeBump`.**~~ **Resolved — root cause is pnpm 10, not us.** Reproduced on nhost with a clean tree: `git checkout -- . && pnpm install --lockfile-only` (with or without `--frozen-lockfile`) mutates workspace `package.json` files on its own. pnpm 10 syncs `pnpm.overrides` rules into any workspace whose declared range overlaps an override's selector — it rewrites the declared range to the override's target value, sorts the deps block alphabetically, and emits a blank line as part of its formatter. Every diff matched an existing override exactly (esbuild `^0.24.0`→`>=0.25.0` via `esbuild@<=0.24.2`; postcss `^8.4.38`→`>=8.5.10` via `postcss@<8.5.10`; svelte `^5.38.1`→`>=5.53.5` via `svelte@<=5.53.4`). `sjson.SetBytes` in `writeBump` was innocent. The `@jest/globals` move in `services/functions` was pnpm's alphabetical sort during its rewrite of esbuild.
+
+  **Needs discussion — how should `deps fix` handle this?** On any repo with pre-existing `pnpm.overrides`, our post-edit `pnpm install --lockfile-only` will broaden the diff with pnpm-induced rewrites we didn't plan. Worse, adding a *new* override during `fix` will then propagate into workspace files on the next install. Options to weigh:
+  1. **Snapshot & restore.** Snapshot every workspace `package.json` before install; after install, restore any change that wasn't in our planned `Edit` set. Keeps diffs clean but fights pnpm — risk that pnpm refuses to install with "stale" workspace files on the next run.
+  2. **Detect & report.** Don't fight pnpm — diff workspace files after install, surface pnpm-induced changes as a warning (or a new exit code) alongside our planned edits. Pushes the user to decide.
+  3. **Skip install in `fix`.** Apply edits, leave lockfile + reconciliation to the user. Loses re-audit verification.
+  4. **Accept it.** Document the behavior; let pnpm's rewrites land in the PR as-is.
+
+  Decision pending. Until then, `deps fix` on repos with existing overrides will produce diffs that include pnpm reconciliation noise.
 
 ## Reference
 

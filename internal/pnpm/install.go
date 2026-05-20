@@ -4,19 +4,14 @@ import (
 	"fmt"
 )
 
-// Install runs `pnpm install` (with --lockfile-only when set) at root.
-// Output is captured; on failure the combined stderr is included in
-// the error message.
-func (a *Adapter) Install(root string, lockfileOnly bool) error {
+// Install runs `pnpm install` at root. Output is captured; on failure
+// the combined stderr is included in the error message.
+func (a *Adapter) Install(root string) error {
 	run := a.runner
 	if run == nil {
 		run = defaultRunner
 	}
-	args := []string{"install"}
-	if lockfileOnly {
-		args = append(args, "--lockfile-only")
-	}
-	stdout, stderr, exit, runErr := run(root, "pnpm", args...)
+	stdout, stderr, exit, runErr := run(root, "pnpm", "install")
 	if runErr != nil {
 		return fmt.Errorf("run pnpm install in %s: %w", root, runErr)
 	}

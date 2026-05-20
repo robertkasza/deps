@@ -17,7 +17,7 @@ go build ./cmd/deps                          # produces ./deps in repo root
 # run
 ./deps check --dir <monorepo>                # plan, no writes
 ./deps check --dir <monorepo> --json         # machine-readable plan
-./deps fix   --dir <monorepo>                # apply + install --lockfile-only + re-audit
+./deps fix   --dir <monorepo>                # apply + pnpm install + re-audit
 
 # test
 go test ./...                                 # all packages
@@ -31,7 +31,7 @@ go test ./internal/pnpm/ -run TestParseAudit # single test by name
 
 ## Architecture
 
-Pipeline: `discover → audit → triage → plan → (fix only: apply → install --lockfile-only → re-audit)`. Each stage is a separate package; data flows through `pkgmgr.Workspace`, `Advisory`, `Finding`, `Edit`, `Plan`.
+Pipeline: `discover → audit → triage → plan → (fix only: apply → pnpm install → re-audit)`. Each stage is a separate package; data flows through `pkgmgr.Workspace`, `Advisory`, `Finding`, `Edit`, `Plan`.
 
 Three orthogonal layers:
 

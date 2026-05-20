@@ -88,10 +88,12 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return exitErr{code: 1, msg: fmt.Sprintf("apply edits: %v", err)}
 	}
 
-	// Phase 3: regenerate the lockfile.
+	// Phase 3: regenerate the lockfile and node_modules. A full install
+	// (not --lockfile-only) is required because pnpm 11's audit refuses
+	// to run when node_modules is out of sync with the lockfile.
 	rootDir := monorepoRoot(workspaces, opts.Dir)
-	fmt.Fprintf(stderr, "running pnpm install --lockfile-only in %s...\n", rootDir)
-	if err := pm.Install(rootDir, true); err != nil {
+	fmt.Fprintf(stderr, "running pnpm install in %s...\n", rootDir)
+	if err := pm.Install(rootDir); err != nil {
 		return exitErr{code: 1, msg: fmt.Sprintf("pnpm install failed: %v", err)}
 	}
 

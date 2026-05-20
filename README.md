@@ -36,8 +36,8 @@ deps check --concurrency 5                    # parallel audits (default 3)
 
 ### `deps fix`
 
-Runs `check`, applies the resulting edits, runs `pnpm install --lockfile-only`,
-re-audits to verify each targeted advisory is gone.
+Runs `check`, applies the resulting edits, runs `pnpm install`, re-audits to
+verify each targeted advisory is gone.
 
 ```
 deps fix --dir /path/to/monorepo

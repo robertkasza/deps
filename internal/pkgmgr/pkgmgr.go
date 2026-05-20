@@ -26,9 +26,9 @@ type PkgManager interface {
 	// targeting the same package or override key are coalesced.
 	ApplyEdits(edits []Edit) ([]Edit, error)
 
-	// Install regenerates the lockfile after edits. lockfileOnly == true
-	// skips populating node_modules.
-	Install(root string, lockfileOnly bool) error
+	// Install runs `pnpm install` at the monorepo root after edits,
+	// regenerating both the lockfile and node_modules before re-auditing.
+	Install(root string) error
 }
 
 // Detect returns the appropriate PkgManager for a directory by looking

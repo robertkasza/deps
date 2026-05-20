@@ -199,12 +199,96 @@ func newScalar(v string) *yaml.Node {
 }
 
 func writeYAML(path string, doc *yaml.Node) error {
-	out, err := yaml.Marshal(doc)
+	src, err := os.ReadFile(path)
 	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(detectYAMLIndent(src))
+	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("marshal %s: %w", path, err)
 	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("marshal %s: %w", path, err)
+	}
+	out := reinjectBlankLines(src, buf.Bytes())
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
+}
+
+// reinjectBlankLines re-adds blank lines before top-level keys in out
+// that had blank lines before them in src. yaml.v3's encoder strips
+// these, so we restore them to keep diffs minimal.
+func reinjectBlankLines(src, out []byte) []byte {
+	blanks := blankBeforeTopKeys(src)
+	if len(blanks) == 0 {
+		return out
+	}
+	lines := strings.Split(string(out), "\n")
+	var b strings.Builder
+	b.Grow(len(out) + len(blanks)*2)
+	for _, line := range lines {
+		if key, ok := topLevelKey(line); ok && blanks[key] {
+			if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n\n") {
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	// Strings.Split + rejoin adds a trailing newline if the input ended
+	// with one; trim the extra we just appended.
+	s := b.String()
+	return []byte(strings.TrimSuffix(s, "\n"))
+}
+
+// blankBeforeTopKeys returns the set of top-level keys that have at
+// least one blank line immediately before them in src.
+func blankBeforeTopKeys(src []byte) map[string]bool {
+	out := map[string]bool{}
+	lines := strings.Split(string(src), "\n")
+	prevBlank := false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			prevBlank = true
+			continue
+		}
+		if key, ok := topLevelKey(line); ok && prevBlank {
+			out[key] = true
+		}
+		prevBlank = false
+	}
+	return out
+}
+
+// topLevelKey returns the key name if line is a top-level mapping key
+// (column 0, ends with ":" or "key: value"), else "", false.
+func topLevelKey(line string) (string, bool) {
+	if line == "" || line[0] == ' ' || line[0] == '\t' || line[0] == '#' || line[0] == '-' {
+		return "", false
+	}
+	i := strings.IndexByte(line, ':')
+	if i <= 0 {
+		return "", false
+	}
+	return line[:i], true
+}
+
+// detectYAMLIndent returns the indent width of the first indented line
+// in src. Defaults to 2 spaces.
+func detectYAMLIndent(src []byte) int {
+	for _, line := range strings.Split(string(src), "\n") {
+		if line == "" {
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " ")
+		n := len(line) - len(trimmed)
+		if n > 0 && !strings.HasPrefix(trimmed, "#") {
+			return n
+		}
+	}
+	return 2
 }
