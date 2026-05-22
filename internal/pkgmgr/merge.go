@@ -13,6 +13,11 @@ import (
 // vulnerable version) and the highest To (so the pinned version clears
 // every advisory).
 //
+// It also collapses repeated EditExcludeFromCooldown entries that
+// target the same (File, Package, To) — these can be emitted once per
+// transitive parent that pulls in the same vuln, and the de-duped
+// result is what gets written to pnpm-workspace.yaml anyway.
+//
 // Called twice in the pipeline: once inside plan.Build to merge
 // overrides emitted within a single workspace's plan, and once at
 // flatten time across workspaces (overrides land in the monorepo root,
@@ -20,25 +25,44 @@ import (
 // to one entry on disk).
 //
 // Reason strings are concatenated so the merged entry still names every
-// GHSA it covers. Non-override edits pass through untouched.
+// GHSA it covers. Non-mergeable edits pass through untouched.
 func MergeOverrides(edits []Edit) []Edit {
-	type key struct{ file, pkg string }
+	type key struct{ file, pkg, to string }
 	idx := map[key]int{}
 	out := make([]Edit, 0, len(edits))
 	for _, e := range edits {
-		if e.Kind != EditOverrideAdd {
+		switch e.Kind {
+		case EditOverrideAdd:
+			k := key{e.File, e.Package, ""}
+			if i, ok := idx[k]; ok {
+				out[i] = mergeOverridePair(out[i], e)
+				continue
+			}
+			idx[k] = len(out)
 			out = append(out, e)
-			continue
+		case EditExcludeFromCooldown:
+			k := key{e.File, e.Package, e.To}
+			if i, ok := idx[k]; ok {
+				out[i] = mergeCooldownPair(out[i], e)
+				continue
+			}
+			idx[k] = len(out)
+			out = append(out, e)
+		default:
+			out = append(out, e)
 		}
-		k := key{e.File, e.Package}
-		if i, ok := idx[k]; ok {
-			out[i] = mergeOverridePair(out[i], e)
-			continue
-		}
-		idx[k] = len(out)
-		out = append(out, e)
 	}
 	return out
+}
+
+func mergeCooldownPair(a, b Edit) Edit {
+	if b.Reason != "" && !strings.Contains(a.Reason, b.Reason) {
+		a.Reason = a.Reason + "; " + b.Reason
+	}
+	if a.RejectionNotes == "" {
+		a.RejectionNotes = b.RejectionNotes
+	}
+	return a
 }
 
 func mergeOverridePair(a, b Edit) Edit {
@@ -50,6 +74,14 @@ func mergeOverridePair(a, b Edit) Edit {
 	}
 	if b.Reason != "" && !strings.Contains(a.Reason, b.Reason) {
 		a.Reason = a.Reason + "; " + b.Reason
+	}
+	// RejectionNotes are per-source-finding context that would be
+	// near-duplicated across merged overrides (the rejection story
+	// is essentially the same for every parent pulling in the same
+	// vuln pkg). Keep the first non-empty value rather than
+	// concatenating, to avoid 12x bloat when many parents converge.
+	if a.RejectionNotes == "" {
+		a.RejectionNotes = b.RejectionNotes
 	}
 	return a
 }

@@ -75,6 +75,15 @@ const (
 	EditBumpParent          EditKind = "bump-parent"
 	EditOverrideAdd         EditKind = "override-add"
 	EditOverrideConsolidate EditKind = "override-consolidate"
+	// EditExcludeFromCooldown adds an exact-version entry to
+	// pnpm-workspace.yaml's minimumReleaseAgeExclude list, lifting the
+	// install cooldown for one specific patched version so normal
+	// resolution can pick it up. Used when every importer's declared
+	// range already permits the patched version and the only blocker
+	// is the cooldown filter. Edit.Package + Edit.To carry the entry
+	// (e.g., "turbo" + "2.9.14"); Edit.File is the pnpm-workspace.yaml
+	// at the monorepo root.
+	EditExcludeFromCooldown EditKind = "exclude-from-cooldown"
 )
 
 // Edit is a single file mutation a PkgManager will apply.
@@ -103,7 +112,17 @@ type Edit struct {
 	VulnerableRange string
 
 	// Reason is a short human-readable explanation, used in reports.
+	// For override edits this is concatenated across merges, so it
+	// must stay short — one clause per source override edit.
 	Reason string
+
+	// RejectionNotes records why higher rungs of the remediation
+	// ladder weren't chosen for this edit (e.g., "parent-bump not
+	// viable: …; cooldown-bypass not viable: …"). Unlike Reason,
+	// this is *not* concatenated when overrides merge — the first
+	// non-empty value is kept, since the rejection story is similar
+	// across same-vuln-pkg overrides from different parents.
+	RejectionNotes string
 }
 
 // Unresolved represents a finding deps refuses to auto-remediate in MVP
@@ -117,4 +136,22 @@ type Unresolved struct {
 type Plan struct {
 	Actionable []Edit
 	Unresolved []Unresolved
+}
+
+// ImporterEdge describes one place in a resolved dep tree where a
+// target package@version appears as a direct dependency. Used by
+// plan's cooldown-bypass remediation to walk back from a vulnerable
+// package to every importer that declared it.
+//
+// For workspace-direct edges (IsWorkspace == true), DeclaredRange is
+// filled from the lockfile's specifier field (the range that lives in
+// the workspace's package.json). For transitive edges, DeclaredRange
+// is empty — the caller must fetch it from the npm registry using
+// ImporterName + ImporterVersion, since lockfiles don't preserve the
+// declared ranges of transitive packages.
+type ImporterEdge struct {
+	IsWorkspace     bool
+	ImporterName    string // workspace relative dir, or transitive package name
+	ImporterVersion string // empty for workspaces; bare version for transitive
+	DeclaredRange   string // filled for workspace edges only
 }

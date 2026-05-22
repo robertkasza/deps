@@ -43,9 +43,31 @@ const (
 	ReasonParentNotInDeps   = "parent-not-in-deps"
 )
 
+// TreeInspector enumerates importers of a vulnerable package in the
+// resolved tree of a specific workspace. Pnpm monorepos using
+// sharedWorkspaceLockfile=false have one lockfile per workspace, so
+// the lookup must be scoped per workspace, not global.
+//
+// nil means the cooldown-bypass rung is unavailable and plan should
+// skip it.
+type TreeInspector interface {
+	// ImportersOfRange returns every direct-dep edge in the
+	// workspace's resolved tree where pkg is pulled in at a version
+	// satisfying vulnRange (e.g., advisory VulnerableRange "<2.5.1").
+	ImportersOfRange(ws pkgmgr.Workspace, pkg, vulnRange string) []pkgmgr.ImporterEdge
+}
+
 // Builder produces Plans from triaged findings.
 type Builder struct {
 	Registry registry.Client
+	// Tree is consulted to decide cooldown-bypass viability. nil
+	// disables the cooldown rung (override is used directly when the
+	// parent-bump path doesn't apply).
+	Tree TreeInspector
+	// CooldownActive indicates that pnpm will currently apply the
+	// minimumReleaseAge filter in this repo. When false, the cooldown
+	// rung is skipped because an exclude entry would be useless.
+	CooldownActive bool
 }
 
 // New returns a Builder using the given registry client.
@@ -338,8 +360,17 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 		}
 	}
 
+	// parentBumpReason describes why the parent-bump rung didn't pick
+	// up a finding that ended up in fallToOverride. Used when annotating
+	// the eventual override edit so the user can see what was tried.
+	parentBumpReason := parentBumpRejectionReason(parent, vuln, sameMajorParent, predictedSame)
+
 	var fixedBySameMajor []pkgmgr.Finding
-	var fallToOverride []pkgmgr.Finding
+	type rejected struct {
+		finding pkgmgr.Finding
+		why     string
+	}
+	var fallToOverride []rejected
 	for _, f := range withFix {
 		fixed, err := semver.NewConstraint(f.Advisory.FixedRange)
 		if err != nil {
@@ -353,7 +384,7 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 			unresolved = append(unresolved, pkgmgr.Unresolved{Finding: f, Reason: ReasonMajorJumpRequired})
 			continue
 		}
-		fallToOverride = append(fallToOverride, f)
+		fallToOverride = append(fallToOverride, rejected{f, parentBumpReason})
 	}
 
 	var edits []pkgmgr.Edit
@@ -368,10 +399,147 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 			Reason:  groupParentBumpReason(fixedBySameMajor, vuln, predictedSame),
 		})
 	}
-	for _, f := range fallToOverride {
-		edits = append(edits, b.planOverride(f))
+	for _, r := range fallToOverride {
+		e, cdReason := b.tryCooldownBypass(r.finding)
+		if cdReason == "" {
+			edits = append(edits, e)
+			continue
+		}
+		ov := b.planOverride(r.finding)
+		ov.RejectionNotes = composeRejectionNotes(r.why, cdReason)
+		edits = append(edits, ov)
 	}
 	return edits, unresolved, nil
+}
+
+// parentBumpRejectionReason explains in one short phrase why the
+// parent-bump rung couldn't fix a given transitive advisory. It
+// inspects only the same-major candidate; major-jump cases never
+// reach the fall-through branch.
+func parentBumpRejectionReason(parent, vuln string, sameMajorParent, predictedSame *semver.Version) string {
+	switch {
+	case sameMajorParent == nil:
+		return fmt.Sprintf("parent-bump not viable: no newer same-major %s available", parent)
+	case predictedSame == nil:
+		return fmt.Sprintf("parent-bump not viable: latest same-major %s@%s no longer reaches %s in its dep chain",
+			parent, sameMajorParent.Original(), vuln)
+	default:
+		return fmt.Sprintf("parent-bump not viable: latest same-major %s@%s still resolves %s@%s (vulnerable)",
+			parent, sameMajorParent.Original(), vuln, predictedSame.Original())
+	}
+}
+
+// composeRejectionNotes assembles a single-line note explaining why
+// the parent-bump and cooldown-bypass rungs were rejected for this
+// specific finding. Stored on Edit.RejectionNotes (not Reason) so it
+// doesn't multiply across merged overrides.
+func composeRejectionNotes(parentBumpWhy, cooldownWhy string) string {
+	var parts []string
+	if parentBumpWhy != "" {
+		parts = append(parts, parentBumpWhy)
+	}
+	if cooldownWhy != "" {
+		parts = append(parts, "cooldown-bypass not viable: "+cooldownWhy)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// tryCooldownBypass attempts to remediate a transitive finding by
+// adding the lowest fixed version to pnpm-workspace.yaml's
+// minimumReleaseAgeExclude list. Viable only when:
+//   - the cooldown filter is currently active in this repo
+//   - a TreeInspector is configured (we need to enumerate importers)
+//   - a concrete patched version exists in the registry that
+//     satisfies the advisory's FixedRange
+//   - every importer's declared range for the vulnerable package
+//     already permits the patched version (so lifting the cooldown
+//     is the only change needed to make resolution pick the fix)
+//
+// Returns (edit, true) when the bypass is viable; (zero, false)
+// otherwise so the caller falls through to override.
+// tryCooldownBypass returns (edit, "") on success, or
+// (zero, reason) explaining why the bypass wasn't viable. The reason
+// is suitable for embedding in the override edit's Reason field so
+// the user can see why the higher ladder rung was skipped.
+func (b *Builder) tryCooldownBypass(f pkgmgr.Finding) (pkgmgr.Edit, string) {
+	vuln := f.Advisory.Package
+	ghsa := f.Advisory.GHSA
+	if !b.CooldownActive {
+		return pkgmgr.Edit{}, "minimumReleaseAge not active (set in pnpm-workspace.yaml or pnpm >= 11)"
+	}
+	if b.Tree == nil {
+		return pkgmgr.Edit{}, "lockfile not available"
+	}
+	fixed, err := semver.NewConstraint(f.Advisory.FixedRange)
+	if err != nil {
+		return pkgmgr.Edit{}, fmt.Sprintf("unparseable FixedRange %q", f.Advisory.FixedRange)
+	}
+	versions, err := b.Registry.Versions(vuln)
+	if err != nil {
+		return pkgmgr.Edit{}, fmt.Sprintf("registry lookup failed: %v", err)
+	}
+	patched := lowestSatisfying(versions, fixed)
+	if patched == nil {
+		return pkgmgr.Edit{}, fmt.Sprintf("no published %s version satisfies %q", vuln, f.Advisory.FixedRange)
+	}
+
+	rawEdges := b.Tree.ImportersOfRange(f.Advisory.Workspace, vuln, f.Advisory.VulnerableRange)
+	if len(rawEdges) == 0 {
+		return pkgmgr.Edit{}, fmt.Sprintf("no importers of %s@%s in lockfile", vuln, f.Advisory.VulnerableRange)
+	}
+
+	edges, ok := b.resolveDeclaredEdges(rawEdges, vuln)
+	if !ok {
+		return pkgmgr.Edit{}, "could not resolve declared ranges for all importers"
+	}
+	if viable, reason := CanBypassCooldown(edges, patched.Original()); !viable {
+		return pkgmgr.Edit{}, fmt.Sprintf("patched=%s; %s", patched.Original(), reason)
+	}
+
+	return pkgmgr.Edit{
+		Kind:    pkgmgr.EditExcludeFromCooldown,
+		File:    filepath.Join(f.Advisory.Workspace.MonorepoRoot, "pnpm-workspace.yaml"),
+		Package: vuln,
+		To:      patched.Original(),
+		Reason: fmt.Sprintf("lift install cooldown for transitive %s@%s (%s)",
+			vuln, patched.Original(), ghsa),
+	}, ""
+}
+
+// resolveDeclaredEdges turns importer edges from the lockfile into
+// DeclaredEdges by filling in the declared range for each transitive
+// importer (workspace edges already have it from the lockfile).
+//
+// Returns (edges, false) if any registry lookup fails or any importer
+// doesn't list the vulnerable package as a dependency — both indicate
+// we can't prove the bypass is safe and should fall through.
+func (b *Builder) resolveDeclaredEdges(raw []pkgmgr.ImporterEdge, vuln string) ([]DeclaredEdge, bool) {
+	out := make([]DeclaredEdge, 0, len(raw))
+	for _, e := range raw {
+		if e.IsWorkspace {
+			out = append(out, DeclaredEdge{
+				Source:        e.ImporterName,
+				DeclaredRange: e.DeclaredRange,
+			})
+			continue
+		}
+		m, err := b.Registry.Manifest(e.ImporterName, e.ImporterVersion)
+		if err != nil {
+			return nil, false
+		}
+		declared, ok := m.Dependencies[vuln]
+		if !ok {
+			declared = m.PeerDependencies[vuln]
+		}
+		if declared == "" {
+			return nil, false
+		}
+		out = append(out, DeclaredEdge{
+			Source:        e.ImporterName + "@" + e.ImporterVersion,
+			DeclaredRange: declared,
+		})
+	}
+	return out, true
 }
 
 // latestParentInBand returns the highest non-prerelease parent version

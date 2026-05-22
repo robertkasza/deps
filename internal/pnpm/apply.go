@@ -30,6 +30,11 @@ func (a *Adapter) ApplyEdits(edits []pkgmgr.Edit) ([]pkgmgr.Edit, error) {
 			if _, err := writeOverride(root, e.Package, e.VulnerableRange, e.To); err != nil {
 				return applied, fmt.Errorf("apply override %s: %w", e.Package, err)
 			}
+		case pkgmgr.EditExcludeFromCooldown:
+			root := filepath.Dir(e.File)
+			if _, err := writeCooldownExclude(root, e.Package, e.To); err != nil {
+				return applied, fmt.Errorf("apply cooldown-exclude %s: %w", e.Package, err)
+			}
 		default:
 			return applied, fmt.Errorf("unknown edit kind %q", e.Kind)
 		}

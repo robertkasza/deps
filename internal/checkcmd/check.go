@@ -50,12 +50,6 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("discover workspaces: %w", err)
 	}
-	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
-		len(workspaces), opts.Concurrency)
-
-	reg := registry.New()
-	planner := plan.New(reg)
-	results := processAll(pm, planner, workspaces, opts.Concurrency, stderr)
 
 	rootDir := opts.Dir
 	for _, ws := range workspaces {
@@ -64,6 +58,14 @@ func Run(args []string, stdout, stderr io.Writer) error {
 			break
 		}
 	}
+
+	reg := registry.New()
+	planner := plan.New(reg)
+	configureCooldownRung(planner, pm, rootDir, stderr)
+
+	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
+		len(workspaces), opts.Concurrency)
+	results := processAll(pm, planner, workspaces, opts.Concurrency, stderr)
 
 	// Apply --severity once, here. summarize/exit-code, the stderr summary
 	// line, stdout text and JSON output must all agree on the same set of
@@ -138,7 +140,7 @@ type jsonWorkspace struct {
 }
 
 type jsonEdit struct {
-	Kind            string `json:"kind"` // "bump-direct" | "bump-parent" | "override-add"
+	Kind            string `json:"kind"` // "bump-direct" | "bump-parent" | "override-add" | "exclude-from-cooldown"
 	File            string `json:"file"`
 	Package         string `json:"package"`
 	Field           string `json:"field,omitempty"`
@@ -146,6 +148,7 @@ type jsonEdit struct {
 	To              string `json:"to,omitempty"`
 	VulnerableRange string `json:"vulnerableRange,omitempty"`
 	Reason          string `json:"reason,omitempty"`
+	RejectionNotes  string `json:"rejectionNotes,omitempty"`
 }
 
 type jsonUnresolved struct {
@@ -190,6 +193,7 @@ func writeJSON(w io.Writer, root string, results []WorkspaceResult) error {
 					To:              e.To,
 					VulnerableRange: e.VulnerableRange,
 					Reason:          e.Reason,
+					RejectionNotes:  e.RejectionNotes,
 				})
 			}
 			for _, u := range r.Plan.Unresolved {
@@ -328,6 +332,12 @@ func printResults(w io.Writer, results []WorkspaceResult) {
 			case pkgmgr.EditOverrideAdd:
 				fmt.Fprintf(w, "    override     %s@%s -> %s  %s\n",
 					e.Package, e.VulnerableRange, e.To, e.Reason)
+				if e.RejectionNotes != "" {
+					fmt.Fprintf(w, "                 (%s)\n", e.RejectionNotes)
+				}
+			case pkgmgr.EditExcludeFromCooldown:
+				fmt.Fprintf(w, "    cooldown-bypass  %s@%s  %s\n",
+					e.Package, e.To, e.Reason)
 			default:
 				fmt.Fprintf(w, "    %s  %+v\n", e.Kind, e)
 			}
@@ -415,8 +425,9 @@ func mostRelevantSeverity(e pkgmgr.Edit, findings []pkgmgr.Finding) pkgmgr.Sever
 	matched := false
 	for _, f := range findings {
 		switch e.Kind {
-		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate:
-			// Override is root-scoped; ignore the workspace and match by vuln package.
+		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate, pkgmgr.EditExcludeFromCooldown:
+			// Override / cooldown-exclude are root-scoped; ignore the
+			// workspace and match by vuln package.
 			if f.Advisory.Package != e.Package {
 				continue
 			}
@@ -465,4 +476,27 @@ func filterUnresolvedBySeverity(items []pkgmgr.Unresolved, min int) []pkgmgr.Unr
 		}
 	}
 	return out
+}
+
+// configureCooldownRung wires the cooldown-bypass remediation into
+// planner. The TreeInspector lazily parses each workspace's own
+// pnpm-lock.yaml on demand — correct for both sharedWorkspaceLockfile
+// true (every workspace resolves to the same root file, cached) and
+// false (per-workspace lockfiles). Cooldown activity is detected once
+// from the root pnpm-workspace.yaml + pnpm version.
+//
+// Failures in cooldown activity detection log to stderr but never
+// abort the run; the rung is optional and falling through to
+// override-add is always a valid plan.
+func configureCooldownRung(planner *plan.Builder, pm *pnpm.Adapter, rootDir string, stderr io.Writer) {
+	active, err := pm.CooldownActive(rootDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "cooldown rung disabled: probe failed (%v)\n", err)
+		return
+	}
+	planner.Tree = pnpm.NewWorkspaceLockfiles()
+	planner.CooldownActive = active
+	if !active {
+		fmt.Fprintln(stderr, "cooldown rung: minimumReleaseAge not active; bypass remediation disabled")
+	}
 }

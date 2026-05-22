@@ -17,7 +17,8 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - Workspace discovery: parses `pnpm-workspace.yaml` (globs, negation), single-package fallback, `node_modules` exclusion
 - Audit: shells out to `pnpm audit --json` per workspace, attributes findings via path-prefix encoding (`apps__admin>request`)
 - Triage: direct vs transitive based on workspace's `package.json` deps fields; parent identification
-- Plan (SKILL.md ladder): `bump-direct`, `bump-parent` (registry-validated), `override-add`. Distinguishes `major-jump-required` from `no-fix-available`.
+- Plan (SKILL.md ladder): `bump-direct`, `bump-parent` (registry-validated), `exclude-from-cooldown`, `override-add`. Distinguishes `major-jump-required` from `no-fix-available`.
+- **Cooldown-bypass (`exclude-from-cooldown`).** Between `bump-parent` and `override-add` on the transitive ladder. When pnpm's `minimumReleaseAge` filter is what's hiding a patched version from resolution (active via explicit `pnpm-workspace.yaml` setting or by default on pnpm ≥ 11), `deps` checks whether *every* importer of the vulnerable package declares a range that already permits the patched version. If so, it emits an `exclude-from-cooldown` edit that adds the exact patched version (`pkg@1.2.4`) to `minimumReleaseAgeExclude` in `pnpm-workspace.yaml` — no `pnpm.overrides`, cleaner diff, naturally expires. Detection is pure static analysis over the lockfile + registry manifests; no install. Exact-version syntax always (10.19+) so future publishes still soak through the cooldown.
 - **Multi-advisory grouping.** Findings are grouped by `(workspace, package)` for direct deps and `(workspace, parent, vuln pkg)` for transitive deps before the ladder runs. One bump or override per group covers every advisory it can; overrides are merged across the workspace's vuln pkg (broadest vulnerable range, highest fixed target). Within a transitive group, a parent bump is preferred for any advisory it patches even when an override is also needed for a sibling advisory — overrides are sticky tech debt and we never use one when a parent bump would do.
 - Apply: sjson-based JSON edits preserving format (key order, indent, trailing newline); yaml.v3 Node-API edits for `pnpm-workspace.yaml`. The applier is a flat writer — all grouping/dedup is the planner's responsibility.
 - Override target detection: existing `pnpm-workspace.yaml.overrides` wins → existing `package.json.pnpm.overrides` → default to root `package.json` (matches `pnpm audit --fix`)
@@ -229,6 +230,8 @@ Things that work but could be nicer. Each is small, none are blocking.
 
   Helps keep the override list from growing forever as parent packages get bumped over time.
 
+- **`deps prune` for `minimumReleaseAgeExclude` entries.** Sibling to the overrides-prune entry above: scheduled weekly run that removes exclude entries whose versions have aged past the cooldown threshold (registry publish time + `minimumReleaseAge` ≤ now). Keep this out of `deps fix` — bundling stale-entry cleanup into fix PRs bloats reviews with off-topic removals. Narrow exception inside `deps fix`: an exclude entry may be removed in the same pass when *this run's own remediation* makes it redundant (e.g. a parent bump shifts resolution so the prior exclude no longer matches anything in the tree).
+
 - **`--max-major-jump <N>` / `--allow-major`.** Let users opt into auto-applying major-version bumps that today land in `unresolved{major-jump-required}`.
 - **`--prefer=bump|override`.** When both a parent bump and an override could resolve the vuln, override the default.
 - **npm / yarn adapters.** Slot into `internal/npm/`, `internal/yarn/`. The pkgmgr seam is already in place.
@@ -249,7 +252,6 @@ A code-quality pass we owe ourselves before treating this as done. Each is a rea
 
 - **`internal/report/` is a stub.** Output-formatting logic lives inside `checkcmd` and `fixcmd`, duplicated between them. Move both human and JSON formatters into `internal/report/` so each command writes a single line of "format this Plan + WorkspaceResults" and the code path is shared.
 - **`processAll` is duplicated in `checkcmd` and `fixcmd`.** Near-identical bodies (audit → triage → plan per workspace, bounded concurrency, progress reporting). Extract to one place — likely `internal/pipeline/` — once the API is stable. Was reasonable while we were iterating; less so now that both copies have drifted only by what they wrap around.
-- **0.x semver handling is naive.** We use `Major()` from `Masterminds/semver/v3`, which returns `0` for every 0.x version. npm semver treats the minor as the breaking line for `0.x.y` — so `^0.24.0` and `^0.25.0` are *not* compatible, but our same-major check thinks they are. Real packages pin pre-1.0 deps; we'll miscategorize parent-major-bump cases on those today.
 - **No real integration test against pnpm.** All tests use fakes. When pnpm changes its audit JSON or override semantics, we won't notice until a real run breaks. A skip-by-default test that runs `pnpm audit` on `playground/vuln-test` would catch regressions cheaply.
 - **Inconsistent error message style.** Some surface as `deps: <wrap>: <inner>` (multi-level wrapping), some as flat strings. Not bad; not deliberate either. Worth a pass to settle on one shape.
 

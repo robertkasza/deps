@@ -56,8 +56,11 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("discover workspaces: %w", err)
 	}
 
+	rootDir := monorepoRoot(workspaces, opts.Dir)
+
 	reg := registry.New()
 	planner := plan.New(reg)
+	configureCooldownRung(planner, pm, rootDir, stderr)
 
 	// Phase 1: produce the plan (audit + triage + plan per workspace).
 	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
@@ -81,17 +84,29 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	// Phase 2: apply edits.
-	allEdits, targetedGHSAs, editedWorkspaces, hasOverride := flatten(results)
+	allEdits, targetedGHSAs, editedWorkspaces, cooldownDirs, hasOverride := flatten(results)
 	fmt.Fprintf(stderr, "applying %d candidate edit(s)...\n", len(allEdits))
 	applied, err := pm.ApplyEdits(allEdits)
 	if err != nil {
 		return exitErr{code: 1, msg: fmt.Sprintf("apply edits: %v", err)}
 	}
 
-	// Phase 3: regenerate the lockfile and node_modules. A full install
-	// (not --lockfile-only) is required because pnpm 11's audit refuses
-	// to run when node_modules is out of sync with the lockfile.
-	rootDir := monorepoRoot(workspaces, opts.Dir)
+	// Phase 3a: trigger lockfile re-resolution for any workspace
+	// that received a cooldown-bypass edit. Plain `pnpm install`
+	// ignores fresh minimumReleaseAgeExclude entries — the resolver
+	// considers the lockfile "already up to date" and skips. `pnpm
+	// audit --fix update` is the only command that re-resolves
+	// against the new exclude list. cooldownDirs is a minimum set
+	// cover of workspaces that collectively include every unique
+	// cooldown-bypass package.
+	for _, wsDir := range cooldownDirs {
+		fmt.Fprintf(stderr, "running pnpm audit --fix update in %s...\n", wsDir)
+		if err := pm.AuditFixUpdate(wsDir); err != nil {
+			return exitErr{code: 1, msg: fmt.Sprintf("pnpm audit --fix update failed: %v", err)}
+		}
+	}
+
+	// Phase 3b: regenerate the lockfile for bumps and overrides.
 	fmt.Fprintf(stderr, "running pnpm install in %s...\n", rootDir)
 	if err := pm.Install(rootDir); err != nil {
 		return exitErr{code: 1, msg: fmt.Sprintf("pnpm install failed: %v", err)}
@@ -154,6 +169,12 @@ func printApplied(w io.Writer, applied []pkgmgr.Edit, rootDir string) {
 		case pkgmgr.EditOverrideAdd, pkgmgr.EditOverrideConsolidate:
 			fmt.Fprintf(w, "    override     %s@%s -> %s  in %s\n",
 				e.Package, e.VulnerableRange, e.To, loc)
+			if e.RejectionNotes != "" {
+				fmt.Fprintf(w, "                 (%s)\n", e.RejectionNotes)
+			}
+		case pkgmgr.EditExcludeFromCooldown:
+			fmt.Fprintf(w, "    cooldown-bypass  %s@%s  in %s\n",
+				e.Package, e.To, loc)
 		default:
 			fmt.Fprintf(w, "    %s  %+v\n", e.Kind, e)
 		}
@@ -292,10 +313,17 @@ func flatten(results []WorkspaceResult) (
 	edits []pkgmgr.Edit,
 	targetedGHSAs map[string]bool,
 	editedWorkspaces map[string]bool,
+	cooldownDirs []string,
 	hasOverride bool,
 ) {
 	targetedGHSAs = map[string]bool{}
 	editedWorkspaces = map[string]bool{}
+	// cooldownPkgsByWS[workspaceDir] = set of cooldown-bypass package
+	// names emitted in that workspace's plan. Used to compute a
+	// minimum set cover so that pnpm audit --fix update runs in as
+	// few workspaces as possible while still touching every unique
+	// package.
+	cooldownPkgsByWS := map[string]map[string]bool{}
 	for _, r := range results {
 		if r.Err != nil {
 			continue
@@ -308,6 +336,12 @@ func flatten(results []WorkspaceResult) (
 			if e.Kind == pkgmgr.EditOverrideAdd || e.Kind == pkgmgr.EditOverrideConsolidate {
 				hasOverride = true
 			}
+			if e.Kind == pkgmgr.EditExcludeFromCooldown {
+				if cooldownPkgsByWS[r.Workspace.Dir] == nil {
+					cooldownPkgsByWS[r.Workspace.Dir] = map[string]bool{}
+				}
+				cooldownPkgsByWS[r.Workspace.Dir][e.Package] = true
+			}
 		}
 		for _, f := range r.Findings {
 			if !inUnresolved(f, r.Plan.Unresolved) {
@@ -315,11 +349,60 @@ func flatten(results []WorkspaceResult) (
 			}
 		}
 	}
+	cooldownDirs = greedySetCover(cooldownPkgsByWS)
 	// Overrides target the monorepo root, so multiple workspaces all
 	// emitting an override for the same vuln pkg must collapse to one
 	// entry. Per-workspace mergeOverrides inside Build can't see this.
 	edits = pkgmgr.MergeOverrides(edits)
-	return edits, targetedGHSAs, editedWorkspaces, hasOverride
+	return edits, targetedGHSAs, editedWorkspaces, cooldownDirs, hasOverride
+}
+
+// greedySetCover picks the minimum set of workspace dirs (a greedy
+// approximation; set cover is NP-hard) needed to "touch" every unique
+// cooldown-bypass package name. Running `pnpm audit --fix update` in
+// a chosen workspace will refresh every package vulnerable in that
+// workspace across the rest of the tree (per pnpm's documented
+// behavior); picking the workspace with the largest uncovered
+// coverage at each step minimizes invocations.
+//
+// Returned dirs are sorted by selection order. Empty input yields nil.
+func greedySetCover(pkgsByWS map[string]map[string]bool) []string {
+	universe := map[string]bool{}
+	for _, pkgs := range pkgsByWS {
+		for p := range pkgs {
+			universe[p] = true
+		}
+	}
+	if len(universe) == 0 {
+		return nil
+	}
+	var picked []string
+	for len(universe) > 0 {
+		bestWS := ""
+		bestCover := 0
+		for ws, pkgs := range pkgsByWS {
+			cover := 0
+			for p := range pkgs {
+				if universe[p] {
+					cover++
+				}
+			}
+			// Tie-break by workspace dir for determinism.
+			if cover > bestCover || (cover == bestCover && cover > 0 && (bestWS == "" || ws < bestWS)) {
+				bestCover = cover
+				bestWS = ws
+			}
+		}
+		if bestWS == "" {
+			break // shouldn't happen — universe was non-empty and pkgsByWS covers it
+		}
+		picked = append(picked, bestWS)
+		for p := range pkgsByWS[bestWS] {
+			delete(universe, p)
+		}
+		delete(pkgsByWS, bestWS)
+	}
+	return picked
 }
 
 func inUnresolved(f pkgmgr.Finding, unresolved []pkgmgr.Unresolved) bool {
@@ -393,3 +476,26 @@ func (e exitErr) Error() string {
 }
 
 func (e exitErr) Code() int { return e.code }
+
+// configureCooldownRung wires the cooldown-bypass remediation into
+// planner. The TreeInspector lazily parses each workspace's own
+// pnpm-lock.yaml on demand — correct for both sharedWorkspaceLockfile
+// true (every workspace resolves to the same root file, cached) and
+// false (per-workspace lockfiles). Cooldown activity is detected once
+// from the root pnpm-workspace.yaml + pnpm version.
+//
+// Failures in cooldown activity detection log to stderr but never
+// abort the run; the rung is optional and falling through to
+// override-add is always a valid plan.
+func configureCooldownRung(planner *plan.Builder, pm *pnpm.Adapter, rootDir string, stderr io.Writer) {
+	active, err := pm.CooldownActive(rootDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "cooldown rung disabled: probe failed (%v)\n", err)
+		return
+	}
+	planner.Tree = pnpm.NewWorkspaceLockfiles()
+	planner.CooldownActive = active
+	if !active {
+		fmt.Fprintln(stderr, "cooldown rung: minimumReleaseAge not active; bypass remediation disabled")
+	}
+}
