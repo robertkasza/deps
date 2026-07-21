@@ -68,6 +68,13 @@ type Builder struct {
 	// minimumReleaseAge filter in this repo. When false, the cooldown
 	// rung is skipped because an exclude entry would be useless.
 	CooldownActive bool
+	// AllowMajor lets the cooldown-bypass rung lift the cooldown for a
+	// patched version even when an importer's declared range doesn't
+	// permit it (typically a major jump on paper). Off by default; the
+	// user opts in via --allow-major when an override has already
+	// drifted the package's effective resolution past the declared
+	// range. See CanBypassCooldown.
+	AllowMajor bool
 }
 
 // New returns a Builder using the given registry client.
@@ -89,13 +96,27 @@ func (b *Builder) Build(findings []pkgmgr.Finding) (pkgmgr.Plan, error) {
 	var directOrder []dkey
 	var transitive []pkgmgr.Finding
 
+	// The same advisory surfaces once per dependency path, so a single
+	// vuln can yield dozens of identical findings within a group. Collapse
+	// those to one per advisory: keeping the duplicates produces repeated
+	// output lines and, worse, overflows the intersected-constraint string
+	// past Masterminds/semver's 512-byte limit when a package is reached
+	// via many paths.
+	seenDirect := map[dkey]map[string]bool{}
+
 	for _, f := range findings {
 		switch f.Kind {
 		case pkgmgr.FindingDirect:
 			k := dkey{f.Advisory.Workspace.PackageJSON, f.Advisory.Package}
 			if _, exists := directGroups[k]; !exists {
 				directOrder = append(directOrder, k)
+				seenDirect[k] = map[string]bool{}
 			}
+			id := advisoryID(f.Advisory)
+			if seenDirect[k][id] {
+				continue
+			}
+			seenDirect[k][id] = true
 			directGroups[k] = append(directGroups[k], f)
 		case pkgmgr.FindingTransitive:
 			transitive = append(transitive, f)
@@ -118,11 +139,18 @@ func (b *Builder) Build(findings []pkgmgr.Finding) (pkgmgr.Plan, error) {
 	type tkey struct{ file, parent, vuln string }
 	transitiveGroups := map[tkey][]pkgmgr.Finding{}
 	var transitiveOrder []tkey
+	seenTransitive := map[tkey]map[string]bool{}
 	for _, f := range transitive {
 		k := tkey{f.Advisory.Workspace.PackageJSON, f.Parent, f.Advisory.Package}
 		if _, exists := transitiveGroups[k]; !exists {
 			transitiveOrder = append(transitiveOrder, k)
+			seenTransitive[k] = map[string]bool{}
 		}
+		id := advisoryID(f.Advisory)
+		if seenTransitive[k][id] {
+			continue
+		}
+		seenTransitive[k][id] = true
 		transitiveGroups[k] = append(transitiveGroups[k], f)
 	}
 	for _, k := range transitiveOrder {
@@ -136,6 +164,19 @@ func (b *Builder) Build(findings []pkgmgr.Finding) (pkgmgr.Plan, error) {
 
 	plan.Actionable = pkgmgr.MergeOverrides(plan.Actionable)
 	return plan, nil
+}
+
+// advisoryID returns a stable identity for an advisory, used to collapse
+// the duplicate findings the same advisory produces across dependency
+// paths. The vulnerable/fixed range pair is part of the key, not just the
+// GHSA: a single GHSA can cover several major lines of the same package
+// (e.g. ws's GHSA-96hv-2xvq-fx4p patches 6.2.4, 7.5.11 and 8.21.0
+// separately), surfacing as distinct records with different ranges. Those
+// are NOT duplicates — each needs its own remediation — so keying on GHSA
+// alone would wrongly drop all but one line. True per-path duplicates
+// share the GHSA and both ranges, so they still collapse.
+func advisoryID(a pkgmgr.Advisory) string {
+	return a.GHSA + "|" + a.VulnerableRange + "|" + a.FixedRange
 }
 
 // isNoFix reports whether the advisory's patched_versions string
@@ -381,7 +422,18 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 			continue
 		}
 		if predictedNewer != nil && fixed.Check(predictedNewer) {
-			unresolved = append(unresolved, pkgmgr.Unresolved{Finding: f, Reason: ReasonMajorJumpRequired})
+			// A same-major parent bump can't carry the fix and only a
+			// newer-major parent would pull a fixed version through natural
+			// resolution. We don't auto-apply breaking major parent bumps —
+			// but the vulnerable package itself only needs a same-major bump,
+			// which an override delivers directly without touching the
+			// parent. Fall through to the override rung instead of
+			// abandoning the finding as major-jump-required (which left
+			// trivially-patchable transitive vulns unfixed; `pnpm audit
+			// --fix` resolves these via the same override).
+			why := fmt.Sprintf("parent-bump would require a major jump: only %s@%s (new major) resolves %s to a fixed version",
+				parent, newerMajorParent.Original(), vuln)
+			fallToOverride = append(fallToOverride, rejected{f, why})
 			continue
 		}
 		fallToOverride = append(fallToOverride, rejected{f, parentBumpReason})
@@ -492,8 +544,19 @@ func (b *Builder) tryCooldownBypass(f pkgmgr.Finding) (pkgmgr.Edit, string) {
 	if !ok {
 		return pkgmgr.Edit{}, "could not resolve declared ranges for all importers"
 	}
-	if viable, reason := CanBypassCooldown(edges, patched.Original()); !viable {
+	if viable, reason := CanBypassCooldown(edges, patched.Original(), b.AllowMajor); !viable {
 		return pkgmgr.Edit{}, fmt.Sprintf("patched=%s; %s", patched.Original(), reason)
+	}
+
+	reason := fmt.Sprintf("lift install cooldown for transitive %s@%s (%s)",
+		vuln, patched.Original(), ghsa)
+	// Flag when --allow-major was what carried this past the declared
+	// range, so the plan output makes the opt-in visible rather than
+	// presenting an out-of-range patch as routine.
+	if b.AllowMajor {
+		if strict, _ := CanBypassCooldown(edges, patched.Original(), false); !strict {
+			reason += " [--allow-major: patched version is outside an importer's declared range]"
+		}
 	}
 
 	return pkgmgr.Edit{
@@ -501,8 +564,7 @@ func (b *Builder) tryCooldownBypass(f pkgmgr.Finding) (pkgmgr.Edit, string) {
 		File:    filepath.Join(f.Advisory.Workspace.MonorepoRoot, "pnpm-workspace.yaml"),
 		Package: vuln,
 		To:      patched.Original(),
-		Reason: fmt.Sprintf("lift install cooldown for transitive %s@%s (%s)",
-			vuln, patched.Original(), ghsa),
+		Reason:  reason,
 	}, ""
 }
 

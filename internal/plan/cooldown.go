@@ -34,6 +34,17 @@ type DeclaredEdge struct {
 // Returns (true, "") if the bypass is viable, or (false, reason)
 // describing the first edge that blocks it.
 //
+// allowMajor relaxes the one check that an importer's declared range
+// must permit the patched version. This is the user-opted-in
+// `--allow-major` escape hatch: when an override (or an already-drifted
+// resolution) has pushed the vulnerable package outside an importer's
+// declared range, the effective resolution — not the declared range —
+// governs what pnpm installs, so lifting the cooldown can still reach
+// the patch even though the declared range forbids it on paper. We
+// can't prove that from the declared ranges alone, so the user asserts
+// it. Structural checks (no importers, unparseable range/version) are
+// never relaxed: those mean we can't compute a sound edit at all.
+//
 // Behavior on edge cases:
 //   - No edges → returns (false, "no importers"). The caller almost
 //     certainly has a bug; emitting an exclude with nothing in the
@@ -44,7 +55,7 @@ type DeclaredEdge struct {
 //   - Unparseable range or version → returns (false, reason). Be
 //     conservative: if we can't prove compatibility, fall through
 //     to override.
-func CanBypassCooldown(edges []DeclaredEdge, patchedVersion string) (bool, string) {
+func CanBypassCooldown(edges []DeclaredEdge, patchedVersion string, allowMajor bool) (bool, string) {
 	if len(edges) == 0 {
 		return false, "no importers"
 	}
@@ -64,8 +75,8 @@ func CanBypassCooldown(edges []DeclaredEdge, patchedVersion string) (bool, strin
 		if err != nil {
 			return false, fmt.Sprintf("%s: cannot parse range %q: %v", e.Source, r, err)
 		}
-		if !c.Check(target) {
-			return false, fmt.Sprintf("%s: range %q does not permit %s", e.Source, r, patchedVersion)
+		if !c.Check(target) && !allowMajor {
+			return false, fmt.Sprintf("%s: range %q does not permit %s (override with --allow-major)", e.Source, r, patchedVersion)
 		}
 	}
 	return true, ""

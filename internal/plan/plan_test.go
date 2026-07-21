@@ -137,6 +137,73 @@ func TestBuild_DirectGroupedAcrossAdvisories(t *testing.T) {
 	}
 }
 
+// The same advisory surfaces once per dependency path, so a package
+// reached via many paths yields many identical findings. They must
+// collapse to one before intersecting FixedRanges — joining the raw
+// duplicates produced a constraint string past Masterminds/semver's
+// 512-byte cap, which aborted the whole run. Regression test: 100
+// identical findings must still yield exactly one clean bump.
+func TestBuild_DirectDeduplicatesAcrossPaths(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"devDependencies": {"@babel/core": "^7.20.0"}}`)
+
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"@babel/core": {"7.20.0", "7.29.0", "7.29.1", "8.0.0"},
+		},
+	}
+	var findings []pkgmgr.Finding
+	for i := 0; i < 100; i++ {
+		findings = append(findings, pkgmgr.Finding{
+			Kind: pkgmgr.FindingDirect,
+			Advisory: pkgmgr.Advisory{
+				GHSA: "GHSA-babel", Package: "@babel/core",
+				VulnerableRange: "<=7.29.0", FixedRange: ">=7.29.1",
+				Path: []string{fmt.Sprintf("dep%d", i), "@babel/core"}, Workspace: ws,
+			},
+		})
+	}
+
+	b := New(reg)
+	plan, err := b.Build(findings)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(plan.Actionable) != 1 {
+		t.Fatalf("expected 1 deduped bump, got %d: %+v", len(plan.Actionable), plan.Actionable)
+	}
+	if len(plan.Unresolved) != 0 {
+		t.Fatalf("unresolved should be empty, got %+v", plan.Unresolved)
+	}
+	if e := plan.Actionable[0]; e.To != "^7.29.1" {
+		t.Errorf("to: want ^7.29.1, got %q", e.To)
+	}
+}
+
+// A single GHSA can cover several major lines of the same package, each
+// with its own vulnerable/fixed range (e.g. ws's GHSA-96hv-2xvq-fx4p
+// patches 6.2.4, 7.5.11 and 8.21.0 separately). Those records are NOT
+// duplicates — collapsing them by GHSA alone drops all but one line and
+// leaves the others unfixed after apply. advisoryID must treat findings
+// that differ in range as distinct, while still collapsing true per-path
+// duplicates that share both GHSA and ranges.
+func TestAdvisoryID_DistinguishesMajorLines(t *testing.T) {
+	base := func(vuln, fixed string) pkgmgr.Advisory {
+		return pkgmgr.Advisory{GHSA: "GHSA-96hv-2xvq-fx4p", Package: "ws", VulnerableRange: vuln, FixedRange: fixed}
+	}
+	v7 := base(">=7.0.0 <7.5.11", ">=7.5.11")
+	v8 := base(">=8.0.0 <8.21.0", ">=8.21.0")
+	if advisoryID(v7) == advisoryID(v8) {
+		t.Errorf("distinct major lines must not share an id: %q", advisoryID(v7))
+	}
+	// Same advisory reached via a different path is a true duplicate.
+	v7dup := v7
+	v7dup.Path = []string{"other", "ws"}
+	if advisoryID(v7) != advisoryID(v7dup) {
+		t.Errorf("per-path duplicates must share an id: %q vs %q", advisoryID(v7), advisoryID(v7dup))
+	}
+}
+
 // Mixed group: one advisory has a same-major fix, the other only has a
 // fix in a newer major. The same-major bump still happens for the
 // fixable one; the major-jump advisory remains unresolved.
@@ -548,7 +615,15 @@ func TestBuild_TransitiveOverridesMergedAcrossAdvisories(t *testing.T) {
 	}
 }
 
-func TestBuild_TransitiveMajorJumpRequired(t *testing.T) {
+// When only a newer-MAJOR parent would carry the fix through natural
+// resolution, deps does not abandon the finding: the vulnerable package
+// itself only needs a same-major bump, which an override delivers
+// directly without the breaking parent bump. The major-jump fact is
+// recorded in RejectionNotes so reviewers see what the "clean" fix
+// would have been. (Earlier behavior left these unfixed as
+// major-jump-required, which is what `pnpm audit --fix` resolves via
+// the same override.)
+func TestBuild_TransitiveMajorParentJumpFallsToOverride(t *testing.T) {
 	dir := t.TempDir()
 	ws := writePkg(t, dir, `{"dependencies": {"foo": "^1.0.0"}}`)
 
@@ -580,18 +655,26 @@ func TestBuild_TransitiveMajorJumpRequired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if len(plan.Actionable) != 0 || len(plan.Unresolved) != 1 {
+	if len(plan.Actionable) != 1 || len(plan.Unresolved) != 0 {
 		t.Fatalf("plan: %+v", plan)
 	}
-	if plan.Unresolved[0].Reason != ReasonMajorJumpRequired {
-		t.Errorf("reason: %q", plan.Unresolved[0].Reason)
+	e := plan.Actionable[0]
+	if e.Kind != pkgmgr.EditOverrideAdd {
+		t.Errorf("kind: want override-add, got %v", e.Kind)
+	}
+	if e.To != ">=2.0.0" {
+		t.Errorf("to: want >=2.0.0, got %q", e.To)
+	}
+	if !strings.Contains(e.RejectionNotes, "major jump") {
+		t.Errorf("RejectionNotes should record the major-jump alternative, got %q", e.RejectionNotes)
 	}
 }
 
-// Same caret-major rule applies to transitive parent bumps: a 0.x
-// minor jump in the parent crosses an incompatibility boundary and
-// must surface as major-jump-required, not a silent parent bump.
-func TestBuild_TransitiveZeroMajorMinorJumpRequired(t *testing.T) {
+// Same caret-major rule for 0.x parents: a 0.x minor jump in the parent
+// crosses an incompatibility boundary, so it's not auto-applied as a
+// parent bump — but the finding still falls through to an override
+// rather than being abandoned.
+func TestBuild_TransitiveZeroMajorMinorJumpFallsToOverride(t *testing.T) {
 	dir := t.TempDir()
 	ws := writePkg(t, dir, `{"dependencies": {"foo": "^0.24.0"}}`)
 
@@ -622,11 +705,11 @@ func TestBuild_TransitiveZeroMajorMinorJumpRequired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if len(plan.Actionable) != 0 || len(plan.Unresolved) != 1 {
+	if len(plan.Actionable) != 1 || len(plan.Unresolved) != 0 {
 		t.Fatalf("plan: %+v", plan)
 	}
-	if plan.Unresolved[0].Reason != ReasonMajorJumpRequired {
-		t.Errorf("reason: %q", plan.Unresolved[0].Reason)
+	if e := plan.Actionable[0]; e.Kind != pkgmgr.EditOverrideAdd {
+		t.Errorf("kind: want override-add, got %v", e.Kind)
 	}
 }
 

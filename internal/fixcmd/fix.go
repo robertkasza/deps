@@ -23,6 +23,7 @@ type Options struct {
 	Dir         string
 	Severity    string
 	Concurrency int
+	AllowMajor  bool
 }
 
 // Run executes the full check -> apply -> install -> verify pipeline.
@@ -41,6 +42,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.Dir, "dir", ".", "monorepo root (directory containing pnpm-workspace.yaml)")
 	fs.StringVar(&opts.Severity, "severity", "moderate", "minimum severity to act on (low|moderate|high|critical)")
 	fs.IntVar(&opts.Concurrency, "concurrency", defaultConcurrency, "max workspaces audited in parallel")
+	fs.BoolVar(&opts.AllowMajor, "allow-major", false, "allow cooldown-bypass to install a fixed version outside an importer's declared range (e.g. a major jump, matching `pnpm audit --fix update`)")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -60,6 +62,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 
 	reg := registry.New()
 	planner := plan.New(reg)
+	planner.AllowMajor = opts.AllowMajor
 	configureCooldownRung(planner, pm, rootDir, stderr)
 
 	// Phase 1: produce the plan (audit + triage + plan per workspace).
@@ -96,9 +99,9 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	// ignores fresh minimumReleaseAgeExclude entries — the resolver
 	// considers the lockfile "already up to date" and skips. `pnpm
 	// audit --fix update` is the only command that re-resolves
-	// against the new exclude list. cooldownDirs is a minimum set
-	// cover of workspaces that collectively include every unique
-	// cooldown-bypass package.
+	// against the new exclude list. cooldownDirs is every workspace
+	// that received a cooldown-bypass edit — each owns its lockfile
+	// under sharedWorkspaceLockfile=false, so all must be re-resolved.
 	for _, wsDir := range cooldownDirs {
 		fmt.Fprintf(stderr, "running pnpm audit --fix update in %s...\n", wsDir)
 		if err := pm.AuditFixUpdate(wsDir); err != nil {
@@ -349,60 +352,21 @@ func flatten(results []WorkspaceResult) (
 			}
 		}
 	}
-	cooldownDirs = greedySetCover(cooldownPkgsByWS)
+	// Run `pnpm audit --fix update` in EVERY workspace that emitted a
+	// cooldown-bypass edit — not a minimal set cover. With
+	// sharedWorkspaceLockfile=false each workspace has its own lockfile,
+	// so re-resolving the package in one workspace does not touch the
+	// others; a workspace skipped here keeps its vulnerable resolution
+	// (e.g. ws@7.5.10) and the advisory survives re-audit.
+	for dir := range cooldownPkgsByWS {
+		cooldownDirs = append(cooldownDirs, dir)
+	}
+	sort.Strings(cooldownDirs)
 	// Overrides target the monorepo root, so multiple workspaces all
 	// emitting an override for the same vuln pkg must collapse to one
 	// entry. Per-workspace mergeOverrides inside Build can't see this.
 	edits = pkgmgr.MergeOverrides(edits)
 	return edits, targetedGHSAs, editedWorkspaces, cooldownDirs, hasOverride
-}
-
-// greedySetCover picks the minimum set of workspace dirs (a greedy
-// approximation; set cover is NP-hard) needed to "touch" every unique
-// cooldown-bypass package name. Running `pnpm audit --fix update` in
-// a chosen workspace will refresh every package vulnerable in that
-// workspace across the rest of the tree (per pnpm's documented
-// behavior); picking the workspace with the largest uncovered
-// coverage at each step minimizes invocations.
-//
-// Returned dirs are sorted by selection order. Empty input yields nil.
-func greedySetCover(pkgsByWS map[string]map[string]bool) []string {
-	universe := map[string]bool{}
-	for _, pkgs := range pkgsByWS {
-		for p := range pkgs {
-			universe[p] = true
-		}
-	}
-	if len(universe) == 0 {
-		return nil
-	}
-	var picked []string
-	for len(universe) > 0 {
-		bestWS := ""
-		bestCover := 0
-		for ws, pkgs := range pkgsByWS {
-			cover := 0
-			for p := range pkgs {
-				if universe[p] {
-					cover++
-				}
-			}
-			// Tie-break by workspace dir for determinism.
-			if cover > bestCover || (cover == bestCover && cover > 0 && (bestWS == "" || ws < bestWS)) {
-				bestCover = cover
-				bestWS = ws
-			}
-		}
-		if bestWS == "" {
-			break // shouldn't happen — universe was non-empty and pkgsByWS covers it
-		}
-		picked = append(picked, bestWS)
-		for p := range pkgsByWS[bestWS] {
-			delete(universe, p)
-		}
-		delete(pkgsByWS, bestWS)
-	}
-	return picked
 }
 
 func inUnresolved(f pkgmgr.Finding, unresolved []pkgmgr.Unresolved) bool {
@@ -453,11 +417,13 @@ func filterWorkspaces(all []pkgmgr.Workspace, keep map[string]bool) []pkgmgr.Wor
 	return out
 }
 
+// monorepoRoot returns the real pnpm workspace root that all discovered
+// workspaces share. It may be an ancestor of the invocation dir when deps
+// is run from inside a member workspace; shared config, install, and
+// cooldown detection anchor here.
 func monorepoRoot(workspaces []pkgmgr.Workspace, fallback string) string {
-	for _, ws := range workspaces {
-		if ws.IsRoot {
-			return ws.Dir
-		}
+	if len(workspaces) > 0 && workspaces[0].MonorepoRoot != "" {
+		return workspaces[0].MonorepoRoot
 	}
 	return fallback
 }

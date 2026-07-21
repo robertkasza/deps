@@ -7,11 +7,12 @@ import (
 
 func TestCanBypassCooldown(t *testing.T) {
 	tests := []struct {
-		name           string
-		edges          []DeclaredEdge
-		patched        string
-		wantOK         bool
-		wantReasonSub  string // substring expected in the reason when !ok
+		name          string
+		edges         []DeclaredEdge
+		patched       string
+		allowMajor    bool
+		wantOK        bool
+		wantReasonSub string // substring expected in the reason when !ok
 	}{
 		{
 			name: "all ranges permit patched",
@@ -119,10 +120,39 @@ func TestCanBypassCooldown(t *testing.T) {
 			wantOK:        false,
 			wantReasonSub: "1.2.3",
 		},
+		{
+			name: "allowMajor relaxes an out-of-range declared range",
+			edges: []DeclaredEdge{
+				// linkinator-style: declared range stuck on 7.x but the
+				// effective resolution already drifted to 8.x via an override.
+				{Source: "linkinator@7.6.1", DeclaredRange: "^7.16.0"},
+			},
+			patched:    "8.5.0",
+			allowMajor: true,
+			wantOK:     true,
+		},
+		{
+			name:          "allowMajor does not relax structural failures (no importers)",
+			edges:         nil,
+			patched:       "8.5.0",
+			allowMajor:    true,
+			wantOK:        false,
+			wantReasonSub: "no importers",
+		},
+		{
+			name: "allowMajor does not relax an unparseable range",
+			edges: []DeclaredEdge{
+				{Source: "y@2.0.0", DeclaredRange: "not-a-range!!"},
+			},
+			patched:       "8.5.0",
+			allowMajor:    true,
+			wantOK:        false,
+			wantReasonSub: "cannot parse range",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ok, reason := CanBypassCooldown(tt.edges, tt.patched)
+			ok, reason := CanBypassCooldown(tt.edges, tt.patched, tt.allowMajor)
 			if ok != tt.wantOK {
 				t.Fatalf("CanBypassCooldown() ok = %v, want %v (reason=%q)", ok, tt.wantOK, reason)
 			}

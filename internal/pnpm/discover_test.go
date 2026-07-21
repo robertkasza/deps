@@ -171,6 +171,108 @@ func TestDiscoverWorkspaces_RootMarker(t *testing.T) {
 	}
 }
 
+// monorepoFixture is the shared shape for the sub-workspace rerooting
+// tests: a root with two members, one of which (docs) is nested deeper.
+func monorepoFixture(t *testing.T) string {
+	t.Helper()
+	return fixture{
+		"package.json":              `{"name": "root"}`,
+		"pnpm-workspace.yaml":       "packages:\n  - dashboard\n  - docs\n  - packages/*\n",
+		"dashboard/package.json":    `{"name": "dashboard"}`,
+		"docs/package.json":         `{"name": "docs"}`,
+		"packages/ui/package.json":  `{"name": "ui"}`,
+		"packages/api/package.json": `{"name": "api"}`,
+	}.build(t)
+}
+
+func TestDiscoverWorkspaces_FromMemberReroots(t *testing.T) {
+	root := monorepoFixture(t)
+
+	got, err := New().DiscoverWorkspaces(filepath.Join(root, "docs"))
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+
+	// Scoped to docs only — not the whole monorepo.
+	if len(got) != 1 {
+		var names []string
+		for _, ws := range got {
+			names = append(names, ws.Name)
+		}
+		t.Fatalf("expected 1 workspace (docs), got %d: %v", len(got), names)
+	}
+	ws := got[0]
+	if ws.Name != "docs" {
+		t.Errorf("name: got %q, want docs", ws.Name)
+	}
+	if ws.IsRoot {
+		t.Errorf("docs should not be marked IsRoot")
+	}
+	// Shared config anchors at the real root, not docs itself.
+	if ws.MonorepoRoot != root {
+		t.Errorf("MonorepoRoot: got %q, want %q", ws.MonorepoRoot, root)
+	}
+	if ws.RelDir != "docs" {
+		t.Errorf("RelDir: got %q, want docs", ws.RelDir)
+	}
+}
+
+func TestDiscoverWorkspaces_FromMemberSubdirReroots(t *testing.T) {
+	root := monorepoFixture(t)
+	sub := filepath.Join(root, "docs", "src", "pages")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	got, err := New().DiscoverWorkspaces(sub)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "docs" {
+		t.Fatalf("expected to resolve up to docs, got %+v", got)
+	}
+	if got[0].MonorepoRoot != root {
+		t.Errorf("MonorepoRoot: got %q, want %q", got[0].MonorepoRoot, root)
+	}
+}
+
+func TestDiscoverWorkspaces_FromParentDirScopesToChildren(t *testing.T) {
+	root := monorepoFixture(t)
+
+	got, err := New().DiscoverWorkspaces(filepath.Join(root, "packages"))
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	var names []string
+	for _, ws := range got {
+		names = append(names, ws.Name)
+		if ws.MonorepoRoot != root {
+			t.Errorf("%s MonorepoRoot: got %q, want %q", ws.Name, ws.MonorepoRoot, root)
+		}
+	}
+	sort.Strings(names)
+	if !equalSlices(names, []string{"api", "ui"}) {
+		t.Errorf("names: got %v, want [api ui]", names)
+	}
+}
+
+func TestDiscoverWorkspaces_FromRootReturnsAll(t *testing.T) {
+	root := monorepoFixture(t)
+
+	got, err := New().DiscoverWorkspaces(root)
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	var names []string
+	for _, ws := range got {
+		names = append(names, ws.Name)
+	}
+	sort.Strings(names)
+	if !equalSlices(names, []string{"api", "dashboard", "docs", "root", "ui"}) {
+		t.Errorf("names: got %v, want all members + root", names)
+	}
+}
+
 func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

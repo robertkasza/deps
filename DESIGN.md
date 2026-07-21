@@ -19,6 +19,7 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - Triage: direct vs transitive based on workspace's `package.json` deps fields; parent identification
 - Plan (SKILL.md ladder): `bump-direct`, `bump-parent` (registry-validated), `exclude-from-cooldown`, `override-add`. Distinguishes `major-jump-required` from `no-fix-available`.
 - **Cooldown-bypass (`exclude-from-cooldown`).** Between `bump-parent` and `override-add` on the transitive ladder. When pnpm's `minimumReleaseAge` filter is what's hiding a patched version from resolution (active via explicit `pnpm-workspace.yaml` setting or by default on pnpm ≥ 11), `deps` checks whether *every* importer of the vulnerable package declares a range that already permits the patched version. If so, it emits an `exclude-from-cooldown` edit that adds the exact patched version (`pkg@1.2.4`) to `minimumReleaseAgeExclude` in `pnpm-workspace.yaml` — no `pnpm.overrides`, cleaner diff, naturally expires. Detection is pure static analysis over the lockfile + registry manifests; no install. Exact-version syntax always (10.19+) so future publishes still soak through the cooldown.
+  - **`--allow-major` (opt-in).** The declared-range check above is conservative: it compares the patched version against each importer's *declared* range. But when an existing `pnpm.overrides` entry (or prior drift) has already pushed the package's *effective* resolution past the declared range — e.g. linkinator declares `undici@^7.16.0` but an open-ended override has resolved it to `8.0.2` — the cooldown, not the declared range, is the only thing pinning the old patch. The declared range forbids the patched `8.5.0` on paper, so the rung is rejected by default and `deps` falls to `override-add`. `--allow-major` (on both `check` and `fix`) relaxes *only* that declared-range check (structural checks — no importers, unparseable range — are never relaxed), letting the cooldown-bypass fire. This is what makes `deps` match `pnpm audit --fix update` in this shape. Off by default because we can't prove from declared ranges alone that the effective resolution will actually reach the patch; the user asserts it, the edit's `Reason` records the opt-in, and `deps fix`'s post-apply re-audit catches a no-op (surfaces as `unresolved-after-apply`).
 - **Multi-advisory grouping.** Findings are grouped by `(workspace, package)` for direct deps and `(workspace, parent, vuln pkg)` for transitive deps before the ladder runs. One bump or override per group covers every advisory it can; overrides are merged across the workspace's vuln pkg (broadest vulnerable range, highest fixed target). Within a transitive group, a parent bump is preferred for any advisory it patches even when an override is also needed for a sibling advisory — overrides are sticky tech debt and we never use one when a parent bump would do.
 - Apply: sjson-based JSON edits preserving format (key order, indent, trailing newline); yaml.v3 Node-API edits for `pnpm-workspace.yaml`. The applier is a flat writer — all grouping/dedup is the planner's responsibility.
 - Override target detection: existing `pnpm-workspace.yaml.overrides` wins → existing `package.json.pnpm.overrides` → default to root `package.json` (matches `pnpm audit --fix`)
@@ -129,8 +130,10 @@ Groups findings, then walks the SKILL.md ladder per advisory within each group, 
 | Direct, fix in same major | participates in the group's `bump-direct` |
 | Direct, fix requires major jump | `unresolved{reason: major-jump-required}` (group still bumps for the others) |
 | Transitive, latest same-major parent's predicted resolution clears it | participates in the group's `bump-parent` |
-| Transitive, only newer-major parent's predicted resolution clears it | `unresolved{reason: major-jump-required}` |
+| Transitive, only newer-major parent's predicted resolution clears it | falls through to cooldown-bypass/`override-add` (the vuln pkg only needs a same-major bump, which an override delivers without the breaking parent bump); the major-jump alternative is recorded in `Edit.RejectionNotes` |
 | Transitive, no parent version's predicted resolution clears it | contributes to an `override-add` (merged across the workspace's vuln pkg) |
+
+`major-jump-required` therefore means *the direct dependency in the manifest itself needs a major bump* — it is never used for transitive findings, where the parent (not the vuln pkg) is what would need the major bump.
 | No fix published anywhere | `unresolved{reason: no-fix-available}` |
 
 Override format (narrow, per SKILL.md):
@@ -167,6 +170,20 @@ Any GHSA from the plan still present after install is reported as `unresolved-af
 Building for the per-workspace case is always correct. There is no safe shortcut to "audit once at root."
 
 Concurrency is bounded (`--concurrency`, default 3) to stay under npm's rate limit.
+
+### Workspace-root resolution (running from inside a member)
+
+Discovery mirrors pnpm: it walks **up** from the invocation dir (`--dir`, default CWD) to the nearest ancestor `pnpm-workspace.yaml` and treats *that* as the workspace root. `pnpm.overrides` and `minimumReleaseAge` only take effect at the real root, so this is where deps reads cooldown config and writes shared-config edits. Without it, `cd docs && deps fix` wrote `pnpm.overrides` into `docs/package.json` — a member manifest pnpm silently ignores.
+
+Two roots are now distinct: the **invocation dir** controls *audit scope* (what gets checked), while the discovered **workspace root** (`Workspace.MonorepoRoot`, shared by every returned workspace) controls *where shared config is read/written* and where `pnpm install` runs.
+
+Scoping rule, identical for `check` and `fix`:
+- **point at the workspace root** → operate on every member (whole monorepo), as before;
+- **point at a member** (or a member's subdir) → operate on just that member;
+- **point at a dir containing several members** → operate on those members;
+- **point at a non-member dir** → that dir alone if it has a `package.json`, else fall back to the whole workspace.
+
+Member `RelDir` is computed relative to the workspace root (not the invocation dir), which also matches pnpm's global-mode audit path encoding (`docs__...`).
 
 ## Output and CI-readiness
 

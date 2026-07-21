@@ -25,6 +25,7 @@ type Options struct {
 	Severity    string
 	JSON        bool
 	Concurrency int
+	AllowMajor  bool
 }
 
 func Run(args []string, stdout, stderr io.Writer) error {
@@ -36,6 +37,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	fs.StringVar(&opts.Severity, "severity", "moderate", "minimum severity to report (low|moderate|high|critical)")
 	fs.BoolVar(&opts.JSON, "json", false, "emit machine-readable JSON to stdout")
 	fs.IntVar(&opts.Concurrency, "concurrency", defaultConcurrency, "max workspaces audited in parallel")
+	fs.BoolVar(&opts.AllowMajor, "allow-major", false, "allow cooldown-bypass to install a fixed version outside an importer's declared range (e.g. a major jump, matching `pnpm audit --fix update`)")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -51,16 +53,18 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("discover workspaces: %w", err)
 	}
 
+	// All discovered workspaces share the same MonorepoRoot — the real
+	// pnpm workspace root (which may be an ancestor of opts.Dir when
+	// invoked from inside a member). Shared config, install, and cooldown
+	// detection all anchor here, not at opts.Dir.
 	rootDir := opts.Dir
-	for _, ws := range workspaces {
-		if ws.IsRoot {
-			rootDir = ws.Dir
-			break
-		}
+	if len(workspaces) > 0 && workspaces[0].MonorepoRoot != "" {
+		rootDir = workspaces[0].MonorepoRoot
 	}
 
 	reg := registry.New()
 	planner := plan.New(reg)
+	planner.AllowMajor = opts.AllowMajor
 	configureCooldownRung(planner, pm, rootDir, stderr)
 
 	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",

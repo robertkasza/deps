@@ -42,29 +42,91 @@ type packageManifest struct {
 // Glob semantics aim to match pnpm/fast-glob: `*`, `**`, `?`, `[...]`,
 // `{a,b}`, plus leading `!` for excludes. `node_modules` is always
 // excluded implicitly.
-func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
-	absRoot, err := filepath.Abs(root)
+func (a *Adapter) DiscoverWorkspaces(dir string) ([]pkgmgr.Workspace, error) {
+	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
 	}
 
-	rootPkg := filepath.Join(absRoot, "package.json")
+	// pnpm resolves the workspace root by walking up from the working
+	// directory to the nearest pnpm-workspace.yaml; pnpm.overrides and the
+	// minimumReleaseAge cooldown only take effect there. deps mirrors that
+	// so running inside a member (e.g. `cd docs`) reads and writes shared
+	// config at the real root instead of the member's own package.json
+	// (where pnpm would silently ignore it).
+	configRoot := findWorkspaceRoot(absDir)
+	if configRoot == "" {
+		// No pnpm-workspace.yaml anywhere up the tree: standalone repo.
+		rootPkg := filepath.Join(absDir, "package.json")
+		name, err := readPackageName(rootPkg)
+		if err != nil {
+			return nil, fmt.Errorf("read root package.json: %w", err)
+		}
+		return []pkgmgr.Workspace{{
+			Dir:          absDir,
+			RelDir:       "",
+			PackageJSON:  rootPkg,
+			MonorepoRoot: absDir,
+			Name:         name,
+			IsRoot:       true,
+		}}, nil
+	}
+
+	all, err := a.discoverMembers(configRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// Invoked at the workspace root: operate on every member.
+	if absDir == configRoot {
+		return all, nil
+	}
+
+	// Invoked inside the tree: scope to the member(s) selected by absDir,
+	// but every workspace keeps MonorepoRoot == configRoot so shared-config
+	// edits (overrides, cooldown excludes) still land at the real root.
+	if scoped := scopeToDir(all, absDir); len(scoped) > 0 {
+		return scoped, nil
+	}
+
+	// absDir selects no declared member (e.g. a nested non-member dir).
+	// If it has its own package.json, audit just it; otherwise fall back
+	// to the whole workspace rather than auditing nothing.
+	if name, err := readPackageName(filepath.Join(absDir, "package.json")); err == nil {
+		rel, _ := filepath.Rel(configRoot, absDir)
+		return []pkgmgr.Workspace{{
+			Dir:          absDir,
+			RelDir:       filepath.ToSlash(rel),
+			PackageJSON:  filepath.Join(absDir, "package.json"),
+			MonorepoRoot: configRoot,
+			Name:         name,
+			IsRoot:       false,
+		}}, nil
+	}
+	return all, nil
+}
+
+// discoverMembers returns the root workspace plus every member declared
+// by root's pnpm-workspace.yaml. All share MonorepoRoot == root, and
+// member RelDir values are relative to root (matching pnpm's audit path
+// encoding).
+func (a *Adapter) discoverMembers(root string) ([]pkgmgr.Workspace, error) {
+	rootPkg := filepath.Join(root, "package.json")
 	rootName, err := readPackageName(rootPkg)
 	if err != nil {
 		return nil, fmt.Errorf("read root package.json: %w", err)
 	}
 
 	rootWS := pkgmgr.Workspace{
-		Dir:          absRoot,
+		Dir:          root,
 		RelDir:       "",
 		PackageJSON:  rootPkg,
-		MonorepoRoot: absRoot,
+		MonorepoRoot: root,
 		Name:         rootName,
 		IsRoot:       true,
 	}
 
-	wsYAML := filepath.Join(absRoot, "pnpm-workspace.yaml")
-	patterns, err := readWorkspacePatterns(wsYAML)
+	patterns, err := readWorkspacePatterns(filepath.Join(root, "pnpm-workspace.yaml"))
 	if err != nil {
 		return nil, err
 	}
@@ -75,14 +137,14 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 
 	includes, excludes := splitPatterns(patterns)
 
-	matches, err := globWorkspaces(absRoot, includes, excludes)
+	matches, err := globWorkspaces(root, includes, excludes)
 	if err != nil {
 		return nil, err
 	}
 
 	out := []pkgmgr.Workspace{rootWS}
 	for _, dir := range matches {
-		if dir == absRoot {
+		if dir == root {
 			continue // never duplicate the root
 		}
 		pj := filepath.Join(dir, "package.json")
@@ -95,7 +157,7 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 			}
 			return nil, fmt.Errorf("read %s: %w", pj, err)
 		}
-		rel, err := filepath.Rel(absRoot, dir)
+		rel, err := filepath.Rel(root, dir)
 		if err != nil {
 			return nil, fmt.Errorf("relpath %s: %w", dir, err)
 		}
@@ -103,7 +165,7 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 			Dir:          dir,
 			RelDir:       filepath.ToSlash(rel),
 			PackageJSON:  pj,
-			MonorepoRoot: absRoot,
+			MonorepoRoot: root,
 			Name:         name,
 			IsRoot:       false,
 		})
@@ -111,6 +173,50 @@ func (a *Adapter) DiscoverWorkspaces(root string) ([]pkgmgr.Workspace, error) {
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	return out, nil
+}
+
+// findWorkspaceRoot walks up from start (inclusive) to the nearest
+// directory containing a pnpm-workspace.yaml, mirroring how pnpm locates
+// the workspace root. Returns "" if none exists up to the filesystem root.
+func findWorkspaceRoot(start string) string {
+	dir := start
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "pnpm-workspace.yaml")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// scopeToDir filters discovered members to those selected by absDir: a
+// member is in scope if it sits at or below absDir (invoking from a dir
+// containing several members) or if absDir sits within it (invoking from
+// a member's subdirectory). The root workspace is never selected this
+// way — it's returned only when the invocation dir IS the workspace root.
+func scopeToDir(all []pkgmgr.Workspace, absDir string) []pkgmgr.Workspace {
+	var out []pkgmgr.Workspace
+	for _, ws := range all {
+		if ws.IsRoot {
+			continue
+		}
+		if dirWithin(ws.Dir, absDir) || dirWithin(absDir, ws.Dir) {
+			out = append(out, ws)
+		}
+	}
+	return out
+}
+
+// dirWithin reports whether path is at or below base.
+func dirWithin(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // readWorkspacePatterns returns the `packages:` globs from the YAML
