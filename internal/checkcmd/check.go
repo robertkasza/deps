@@ -46,7 +46,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	pm := pnpm.New()
+	pm := pnpm.New().WithWarnWriter(stderr)
 	fmt.Fprintln(stderr, "discovering workspaces...")
 	workspaces, err := pm.DiscoverWorkspaces(opts.Dir)
 	if err != nil {

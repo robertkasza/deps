@@ -1,9 +1,11 @@
 package pnpm
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +103,21 @@ func TestDiscoverWorkspaces(t *testing.T) {
 			wantNames: []string{"root", "ui"},
 		},
 		{
+			// pnpm globs with fast-glob's dot:false, so it never descends
+			// into .direnv/.git; deps must not either. The .direnv fixture
+			// here holds an empty package.json (a vendored flake-input test
+			// fixture) — the real-world case that aborted discovery.
+			name: "hidden dot-directories are ignored even when matched",
+			fixture: fixture{
+				"package.json":        `{"name": "root"}`,
+				"pnpm-workspace.yaml": "packages:\n  - '**'\n",
+				"examples/demos/.direnv/flake-inputs/abc-source/tests/fixture1/package.json": ``,
+				".git/modules/x/package.json": `{"name": "gitjunk"}`,
+				"packages/ui/package.json":    `{"name": "ui"}`,
+			},
+			wantNames: []string{"root", "ui"},
+		},
+		{
 			name: "unnamed package is included with empty name",
 			fixture: fixture{
 				"package.json":        `{"name": "root"}`,
@@ -142,6 +159,37 @@ func TestDiscoverWorkspaces(t *testing.T) {
 				t.Errorf("names: got %v, want %v", names, tc.wantNames)
 			}
 		})
+	}
+}
+
+// A member directory whose package.json exists but can't be parsed (empty,
+// truncated, malformed) must be skipped with a warning, not abort discovery
+// of every other workspace.
+func TestDiscoverWorkspaces_MalformedMemberManifestIsSkippedWithWarning(t *testing.T) {
+	root := fixture{
+		"package.json":                 `{"name": "root"}`,
+		"pnpm-workspace.yaml":          "packages:\n  - packages/*\n",
+		"packages/good/package.json":   `{"name": "good"}`,
+		"packages/broken/package.json": ``, // empty → "unexpected end of JSON input"
+	}.build(t)
+
+	var warn bytes.Buffer
+	got, err := New().WithWarnWriter(&warn).DiscoverWorkspaces(root)
+	if err != nil {
+		t.Fatalf("malformed member manifest should not abort discovery: %v", err)
+	}
+
+	var names []string
+	for _, ws := range got {
+		names = append(names, ws.Name)
+	}
+	sort.Strings(names)
+	if !equalSlices(names, []string{"good", "root"}) {
+		t.Errorf("names: got %v, want [good root]", names)
+	}
+
+	if !strings.Contains(warn.String(), filepath.Join("packages", "broken", "package.json")) {
+		t.Errorf("expected warning naming the skipped manifest, got %q", warn.String())
 	}
 }
 

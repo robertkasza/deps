@@ -155,7 +155,12 @@ func (a *Adapter) discoverMembers(root string) ([]pkgmgr.Workspace, error) {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("read %s: %w", pj, err)
+			// A package.json that exists but can't be parsed (empty,
+			// truncated, or otherwise malformed — often a test fixture
+			// vendored inside a dependency's source) must not abort
+			// discovery of every other workspace. Warn and skip it.
+			a.warnf("deps: skipping unreadable manifest %s: %v", pj, err)
+			continue
 		}
 		rel, err := filepath.Rel(root, dir)
 		if err != nil {
@@ -266,7 +271,7 @@ func globWorkspaces(root string, includes, excludes []string) ([]string, error) 
 			return nil, fmt.Errorf("glob %q: %w", pat, err)
 		}
 		for _, rel := range paths {
-			if isUnderNodeModules(rel) {
+			if isIgnoredPath(rel) {
 				continue
 			}
 			if matchesAny(rel, excludes) {
@@ -301,14 +306,38 @@ func matchesAny(path string, patterns []string) bool {
 	return false
 }
 
-func isUnderNodeModules(rel string) bool {
+// isIgnoredPath reports whether a glob match should be skipped because it
+// lies under a directory pnpm's own workspace scan never descends into:
+// node_modules, or any hidden (dot-prefixed) directory such as .git, or
+// direnv/nix caches like .direnv (which vendor dependency sources whose
+// package.json fixtures may be empty or malformed). pnpm globs with
+// fast-glob's dot:false, so `*`/`**` never match dot-segments there either;
+// this keeps deps aligned with that behavior.
+func isIgnoredPath(rel string) bool {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	for _, p := range parts {
 		if p == "node_modules" {
 			return true
 		}
+		if len(p) > 1 && p[0] == '.' {
+			return true
+		}
 	}
 	return false
+}
+
+// warnf writes a non-fatal diagnostic line to the adapter's warn writer
+// (stderr by default), ensuring it ends with a newline.
+func (a *Adapter) warnf(format string, args ...any) {
+	w := a.warnw
+	if w == nil {
+		w = os.Stderr
+	}
+	msg := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+	fmt.Fprint(w, msg)
 }
 
 func readPackageName(path string) (string, error) {
