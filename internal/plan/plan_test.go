@@ -713,6 +713,81 @@ func TestBuild_TransitiveZeroMajorMinorJumpFallsToOverride(t *testing.T) {
 	}
 }
 
+func TestOverrideTarget(t *testing.T) {
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"js-yaml":  {"4.1.0", "4.3.1", "5.0.0"},    // higher major published
+			"capped":   {"2.0.0", "2.5.0", "3.0.0"},    // higher major published
+			"zerox":    {"0.24.0", "0.24.5", "0.25.0"}, // higher minor (0.x band)
+			"stayopen": {"1.0.0", "1.2.3", "1.9.0"},    // no higher major
+		},
+	}
+	b := New(reg)
+	cases := []struct {
+		pkg, fixed, want string
+	}{
+		{"js-yaml", ">=4.3.1", ">=4.3.1 <5.0.0"},        // 1.x+, higher major -> cap
+		{"capped", ">=2.0.0", ">=2.0.0 <3.0.0"},         // 1.x+, higher major -> cap
+		{"zerox", ">=0.24.5", ">=0.24.5 <0.25.0"},       // 0.x, higher minor -> cap
+		{"stayopen", ">=1.2.3", ">=1.2.3"},              // no higher major -> pnpm-parity floor
+		{"unknown", ">=1.2.3", ">=1.2.3"},               // registry error -> floor
+		{"js-yaml", ">=1.2.3 <2.0.0", ">=1.2.3 <2.0.0"}, // compound fixed range -> raw
+		{"js-yaml", "garbage", "garbage"},               // unparseable -> raw
+	}
+	for _, tc := range cases {
+		if got := b.overrideTarget(tc.pkg, tc.fixed); got != tc.want {
+			t.Errorf("overrideTarget(%q, %q) = %q, want %q", tc.pkg, tc.fixed, got, tc.want)
+		}
+	}
+}
+
+// The js-yaml/orval shape: the vuln pkg has a higher major published
+// (5.x) than the fix (4.3.1). An open-ended override would resolve to
+// 5.x and break importers pinned to the 4.x line, so the transitive
+// override must carry the caret ceiling.
+func TestBuild_TransitiveOverrideCapsWhenHigherMajorExists(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"dependencies": {"parent": "^1.0.0"}}`)
+	ws.MonorepoRoot = dir
+
+	reg := &fakeRegistry{
+		versions: map[string][]string{
+			"parent":  {"1.0.0"},
+			"js-yaml": {"4.1.0", "4.3.1", "5.0.0"},
+		},
+		manifests: map[string]map[string]registry.Manifest{
+			"parent": {
+				"1.0.0": {Dependencies: map[string]string{"js-yaml": "4.1.0"}},
+			},
+		},
+	}
+	b := New(reg)
+	plan, err := b.Build([]pkgmgr.Finding{
+		{
+			Kind:   pkgmgr.FindingTransitive,
+			Parent: "parent",
+			Advisory: pkgmgr.Advisory{
+				GHSA: "GHSA-jsyaml", Package: "js-yaml",
+				VulnerableRange: ">=4.0.0 <4.3.1", FixedRange: ">=4.3.1",
+				Path: []string{"parent", "js-yaml"}, Workspace: ws,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(plan.Actionable) != 1 {
+		t.Fatalf("expected 1 override, got %d: %+v", len(plan.Actionable), plan.Actionable)
+	}
+	e := plan.Actionable[0]
+	if e.Kind != pkgmgr.EditOverrideAdd || e.Package != "js-yaml" {
+		t.Fatalf("edit: %+v", e)
+	}
+	if e.To != ">=4.3.1 <5.0.0" {
+		t.Errorf("to: want >=4.3.1 <5.0.0 (capped, higher major exists), got %q", e.To)
+	}
+}
+
 func TestBuild_PreservesOperator(t *testing.T) {
 	cases := []struct {
 		current, want string

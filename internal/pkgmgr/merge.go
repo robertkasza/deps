@@ -122,7 +122,12 @@ func higherFixedTarget(a, b string) string {
 }
 
 func versionInConstraint(s string) *semver.Version {
-	t := s
+	t := strings.TrimSpace(s)
+	// Override targets can now be compound (">=4.3.1 <5.0.0"); compare on
+	// the lower-bound clause only.
+	if i := strings.IndexByte(t, ' '); i >= 0 {
+		t = t[:i]
+	}
 	for _, p := range []string{">=", "<=", "^", "~", ">", "<", "="} {
 		if strings.HasPrefix(t, p) {
 			t = t[len(p):]

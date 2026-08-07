@@ -33,6 +33,7 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - **`audit-ci.jsonc` allowlist support.** The target repo (`nhost/nhost`) uses `audit-ci-recursive` whose allowlist must be honored. `deps` should read `audit-ci.jsonc` from the monorepo root and skip any advisory whose GHSA is allowlisted there — both in plan output (don't emit edits for it) and in re-audit verification (don't count as `unresolved-after-apply`). Without this, `deps` will repeatedly try to fix advisories the team has already accepted.
 
   Format (JSONC):
+
   ```jsonc
   {
     "moderate": true,
@@ -119,6 +120,7 @@ No I/O beyond reading the package.json. No remediation decisions.
 Groups findings, then walks the SKILL.md ladder per advisory within each group, emitting candidate `Edit`s (or pushing to `unresolved`).
 
 **Grouping keys:**
+
 - Direct findings: `(workspace, package)`. One `bump-direct` per group, target version = `pickSmallest` against the *intersection* of every group member's `FixedRange`.
 - Transitive findings: `(workspace, parent, vuln pkg)`. The latest same-major parent's predicted vuln resolution is computed once; each advisory is checked against that prediction. Advisories the prediction clears collapse into a single `bump-parent`; the rest fall to override.
 - Override edits are then merged across `(monorepoRoot, vuln pkg)` — broadest vulnerable range, highest fixed target — so `pnpm.overrides` stays minimal.
@@ -126,7 +128,7 @@ Groups findings, then walks the SKILL.md ladder per advisory within each group, 
 **Per-advisory ladder within a group:**
 
 | Advisory shape | Plan output |
-|---|---|
+| --- | --- |
 | Direct, fix in same major | participates in the group's `bump-direct` |
 | Direct, fix requires major jump | `unresolved{reason: major-jump-required}` (group still bumps for the others) |
 | Transitive, latest same-major parent's predicted resolution clears it | participates in the group's `bump-parent` |
@@ -139,8 +141,18 @@ Groups findings, then walks the SKILL.md ladder per advisory within each group, 
 Override format (narrow, per SKILL.md):
 
 ```json
-"<pkg>@<vulnerable-range>": "<min-fixed-version>"
+"<pkg>@<vulnerable-range>": ">=<min-fixed-version>"
 ```
+
+The default target is the open-ended `>=<min-fixed>` that `pnpm audit --fix` emits — byte-for-byte pnpm parity. A **conditional caret ceiling** is appended only when the registry publishes a version above the fix's caret band (a higher major for 1.x+, a higher minor for 0.x):
+
+```json
+"js-yaml@>=4.0.0 <4.3.1": ">=4.3.1 <5.0.0"
+```
+
+Rationale: pnpm resolves a range override to the *highest* satisfying version, so an open-ended `>=4.3.1` silently crosses into js-yaml 5.x and breaks unrelated importers matched by the same key. But that only happens when a higher major actually exists — in every other case the capped and open-ended forms resolve to the identical version, so we keep pnpm's exact output wherever it already works and diverge only in the precise break case. `hasVersionAboveCaret` gates the cap; if the `FixedRange` is compound/unparseable the raw range is used, and a registry-lookup failure falls back to the open-ended floor (best-effort). See `overrideTarget` in `internal/plan/plan.go`.
+
+Known residual: when an importer's own declared range sits *below* the fix (e.g. orval pins `js-yaml@4.3.0`, fix is `4.3.1`), no patched version satisfies that importer and the override must move it regardless — the cap just minimizes the move (to 4.3.x, not 5.x). A truly unsatisfiable importer should surface as `unresolved` rather than a broken install (not yet enforced).
 
 `plan` consults the npm registry (`registry.npmjs.org` by default; respects `.npmrc` `registry=`) to know whether a non-major parent version exists that depends on a fixed version of the vuln package. In-process cache for the lifetime of one run.
 
@@ -158,6 +170,7 @@ write Edits → pnpm install → pnpm audit --json → check the GHSA is gone
 ```
 
 After all fixes:
+
 - **Per-workspace re-audit** for direct + parent-bump edits (scoped, matches SKILL.md). Implemented: only edited workspaces are re-audited.
 - **Full repo re-audit** if any `override-add` was applied (overrides are global).
 
@@ -178,6 +191,7 @@ Discovery mirrors pnpm: it walks **up** from the invocation dir (`--dir`, defaul
 Two roots are now distinct: the **invocation dir** controls *audit scope* (what gets checked), while the discovered **workspace root** (`Workspace.MonorepoRoot`, shared by every returned workspace) controls *where shared config is read/written* and where `pnpm install` runs.
 
 Scoping rule, identical for `check` and `fix`:
+
 - **point at the workspace root** → operate on every member (whole monorepo), as before;
 - **point at a member** (or a member's subdir) → operate on just that member;
 - **point at a dir containing several members** → operate on those members;

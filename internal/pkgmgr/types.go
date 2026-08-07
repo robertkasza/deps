@@ -38,14 +38,14 @@ const (
 // Advisory is a single vulnerability finding attributed to a workspace.
 // It is the package-manager-agnostic shape that downstream stages consume.
 type Advisory struct {
-	GHSA            string   // e.g., "GHSA-xxxx-xxxx-xxxx"
+	GHSA            string // e.g., "GHSA-xxxx-xxxx-xxxx"
 	Severity        Severity
 	Package         string   // vulnerable package name
 	VulnerableRange string   // semver range that's vulnerable, e.g., "<4.1.3"
 	FixedRange      string   // semver range with a fix, e.g., ">=4.1.3"
 	Path            []string // dependency chain, root-first (e.g., ["request", "tough-cookie"])
 	Workspace       Workspace
-	URL             string   // advisory URL
+	URL             string // advisory URL
 }
 
 // FindingKind distinguishes whether a vulnerable package is declared

@@ -10,16 +10,16 @@
 //
 // The ladder, per advisory within a group:
 //
-//   Direct:
-//     1. fix in same major as current pin                  -> bump-direct (one bump per group covering all same-major-fixable advisories)
-//     2. only major-bump fixes                             -> unresolved{major-jump-required}
-//     3. no fix published                                  -> unresolved{no-fix-available}
+//	Direct:
+//	  1. fix in same major as current pin                  -> bump-direct (one bump per group covering all same-major-fixable advisories)
+//	  2. only major-bump fixes                             -> unresolved{major-jump-required}
+//	  3. no fix published                                  -> unresolved{no-fix-available}
 //
-//   Transitive:
-//     1. latest same-major parent resolves vuln to a fixed version -> bump-parent (one bump per group covering all advisories it patches)
-//     2. only newer-major parent resolves to a fixed version       -> unresolved{major-jump-required}
-//     3. no parent version resolves to a fixed version             -> override-add (merged across the workspace's vuln pkg)
-//     4. no patched version of vuln pkg published anywhere         -> unresolved{no-fix-available}
+//	Transitive:
+//	  1. latest same-major parent resolves vuln to a fixed version -> bump-parent (one bump per group covering all advisories it patches)
+//	  2. only newer-major parent resolves to a fixed version       -> unresolved{major-jump-required}
+//	  3. no parent version resolves to a fixed version             -> override-add (merged across the workspace's vuln pkg)
+//	  4. no patched version of vuln pkg published anywhere         -> unresolved{no-fix-available}
 //
 // Plan operates on package-manager-agnostic types from internal/pkgmgr
 // and consults internal/registry for parent-bump candidate version data.
@@ -745,7 +745,7 @@ func (b *Builder) planOverride(f pkgmgr.Finding) pkgmgr.Edit {
 			File:            f.Advisory.Workspace.PackageJSON,
 			Package:         f.Advisory.Package,
 			VulnerableRange: f.Advisory.VulnerableRange,
-			To:              minVersionFromFixed(f.Advisory.FixedRange),
+			To:              b.overrideTarget(f.Advisory.Package, f.Advisory.FixedRange),
 			Reason:          fmt.Sprintf("override transitive %s (%s)", f.Advisory.Package, f.Advisory.GHSA),
 		}
 	}
@@ -754,17 +754,69 @@ func (b *Builder) planOverride(f pkgmgr.Finding) pkgmgr.Edit {
 		File:            filepath.Join(root, "package.json"),
 		Package:         f.Advisory.Package,
 		VulnerableRange: f.Advisory.VulnerableRange,
-		To:              minVersionFromFixed(f.Advisory.FixedRange),
+		To:              b.overrideTarget(f.Advisory.Package, f.Advisory.FixedRange),
 		Reason:          fmt.Sprintf("override transitive %s (%s)", f.Advisory.Package, f.Advisory.GHSA),
 	}
 }
 
-// minVersionFromFixed extracts the lower bound from a simple
-// patched_versions string. Best-effort; if the range is compound or
-// unparseable, returns the raw string.
-func minVersionFromFixed(fixed string) string {
-	if v := extractAnchor(fixed); v != nil {
-		return ">=" + v.Original()
+// overrideTarget builds the version spec for a pnpm override from an
+// advisory's patched_versions range. The default is the open-ended
+// ">=<min-fixed>" that `pnpm audit --fix` emits, which resolves to the
+// highest published version satisfying it.
+//
+// It appends a caret ceiling ONLY when the registry publishes a version
+// above the fix's caret band (a higher major for 1.x+, a higher minor
+// for 0.x). That is the exact condition under which the open-ended form
+// would let pnpm resolve the override across a breaking boundary and
+// drag unrelated importers onto a new major (e.g. js-yaml 4 -> 5).
+// Whenever no such version exists, the capped and open-ended forms pick
+// the same version, so we stay byte-for-byte identical to
+// `pnpm audit --fix` everywhere it already works.
+//
+// Best-effort: if the fixed range is compound/unparseable, returns it
+// raw; if the registry lookup fails, returns the open-ended floor.
+func (b *Builder) overrideTarget(pkg, fixed string) string {
+	v := extractAnchor(fixed)
+	if v == nil {
+		return fixed
 	}
-	return fixed
+	floor := ">=" + v.Original()
+	versions, err := b.Registry.Versions(pkg)
+	if err != nil {
+		return floor
+	}
+	if !hasVersionAboveCaret(versions, v) {
+		return floor
+	}
+	return floor + " <" + caretCeiling(v)
+}
+
+// hasVersionAboveCaret reports whether any published non-prerelease
+// version sits in a caret band strictly above v's. That is the only
+// case where an open-ended ">=v" override can resolve across a breaking
+// boundary, so it is the only case where a ceiling is needed.
+func hasVersionAboveCaret(versions []string, v *semver.Version) bool {
+	for _, raw := range versions {
+		c, err := semver.NewVersion(raw)
+		if err != nil {
+			continue
+		}
+		if c.Prerelease() != "" {
+			continue
+		}
+		if caretMajorGreater(c, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// caretCeiling returns the exclusive upper bound of v's caret band as a
+// version string: the next major for 1.x+, or the next minor for 0.x
+// (mirroring npm's stricter caret rules for 0.x; see caretMajor).
+func caretCeiling(v *semver.Version) string {
+	if v.Major() == 0 {
+		return fmt.Sprintf("0.%d.0", v.Minor()+1)
+	}
+	return fmt.Sprintf("%d.0.0", v.Major()+1)
 }

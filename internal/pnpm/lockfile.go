@@ -47,9 +47,9 @@ type Snapshot struct {
 // rawLockfile is the on-disk shape we unmarshal into. The public
 // Lockfile struct is a slightly normalized view of this.
 type rawLockfile struct {
-	LockfileVersion string                       `yaml:"lockfileVersion"`
-	Importers       map[string]rawImporter       `yaml:"importers"`
-	Snapshots       map[string]rawSnapshotEntry  `yaml:"snapshots"`
+	LockfileVersion string                      `yaml:"lockfileVersion"`
+	Importers       map[string]rawImporter      `yaml:"importers"`
+	Snapshots       map[string]rawSnapshotEntry `yaml:"snapshots"`
 }
 
 type rawImporter struct {
