@@ -27,24 +27,9 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - Concurrency control: `--concurrency` flag, default 3 (npm rate-limit-friendly)
 - Exit codes: `0` clean · `10` actionable / unresolved present · `20` `unresolved-after-apply` · `1` tool error
 - Tests across all packages with fakes for the runner and registry; real `pnpm audit --json` fixture in `internal/pnpm/testdata/`
+- **`audit-ci.json` / `audit-ci.jsonc` allowlists.** Both commands load root-level GHSA exceptions once after workspace discovery and filter before triage, including post-apply verification. See “Audit-ci allowlists” below.
 
 ### Required, not yet implemented
-
-- **`audit-ci.jsonc` allowlist support.** The target repo (`nhost/nhost`) uses `audit-ci-recursive` whose allowlist must be honored. `deps` should read `audit-ci.jsonc` from the monorepo root and skip any advisory whose GHSA is allowlisted there — both in plan output (don't emit edits for it) and in re-audit verification (don't count as `unresolved-after-apply`). Without this, `deps` will repeatedly try to fix advisories the team has already accepted.
-
-  Format (JSONC):
-
-  ```jsonc
-  {
-    "moderate": true,
-    "allowlist": ["GHSA-xxxx", "GHSA-yyyy"]
-  }
-  ```
-
-  Implementation sketch:
-  - Read + parse the file once during discovery.
-  - Pass the allowlist into `audit` so filtered findings never reach triage.
-  - Surface allowlisted findings only in a separate "skipped (allowlisted)" line in human output, omitted from JSON entirely (or under `skipped`).
 
 - **`lockfile-refresh` edit kind.** A fourth rung at the top of the SKILL.md ladder for transitive findings where the *currently declared* dependency range in some workspace already admits a non-vulnerable version — the lockfile just has a stale resolution. Reference case: [nhost/nhost#4306](https://github.com/nhost/nhost/pull/4306), where `brace-expansion@5.0.5` was resolved under a `^5.0.5` range and `5.0.6` (a patch release) fixed the advisory. The PR touched only `pnpm-lock.yaml` files — zero `package.json` churn, no sticky override, no `pnpm.overrides` to remove later. We currently miss this and fall through to `bump-parent` or `override-add` unnecessarily.
 
@@ -199,6 +184,38 @@ Scoping rule, identical for `check` and `fix`:
 
 Member `RelDir` is computed relative to the workspace root (not the invocation dir), which also matches pnpm's global-mode audit path encoding (`docs__...`).
 
+### Audit-ci allowlists
+
+`deps check` and `deps fix` read `audit-ci.json` (JSON) and `audit-ci.jsonc`
+(JSON with comments and trailing commas) from the **discovered repository root**,
+not the invocation directory. In a single-package repository this is the package
+directory. Workspace-local files are not read. If both root files exist, their
+entries are combined; duplicates have no additional effect.
+
+```jsonc
+{
+  "moderate": true,
+  "allowlist": ["GHSA-xxxx-yyyy-zzzz"]
+}
+```
+
+Only a top-level `allowlist` array of exact GHSA ID strings is supported. Other
+audit-ci settings, such as severity thresholds, are ignored. Package names,
+numeric IDs, path/wildcard rules, and object-form exceptions (including expiry
+metadata) are not supported and produce an error rather than being interpreted
+as broader exceptions. Missing files or a missing/empty allowlist mean no
+exceptions. Malformed or unreadable files fail the command before auditing or
+writing changes (exit 1).
+
+The generic `internal/auditci` package loads the configuration once per command.
+The same immutable allowlist is applied after each audit, before triage and
+planning, and reused during `fix` verification. Matching findings never generate
+edits, unresolved entries, or `unresolved-after-apply` results, and do not affect
+exit codes. An entirely allowlisted run is clean; `fix` does not install or write
+anything. Filtered findings are omitted from JSON. Human progress on stderr
+reports a separate `skipped (allowlisted)` count per workspace/audit; counts are
+findings (dependency paths), not unique GHSAs. Configuration files are read-only.
+
 ## Output and CI-readiness
 
 Deliberate constraints from day one:
@@ -232,6 +249,7 @@ cmd/deps/                  entrypoint
 internal/
   cli/                     subcommand dispatch (check, fix)
   checkcmd/                deps check
+  auditci/                 root audit-ci allowlist loading + advisory filtering
   fixcmd/                  deps fix
   pkgmgr/                  PkgManager interface + shared types
   pnpm/                    pnpm adapter (audit, install, write override, bump)
@@ -273,9 +291,7 @@ Things that work but could be nicer. Each is small, none are blocking.
 
 ## Open questions
 
-1. **`audit-ci.jsonc` parse format.** Different versions of `audit-ci` have used different schemas (top-level allowlist vs. per-severity). Need to settle on one or accept both.
-2. **Where to surface allowlisted advisories in output.** Hide entirely, or show under a `skipped` section?
-3. **Should `deps fix` ever update an existing override** when re-audit shows the original range was insufficient? Today it leaves it; SKILL.md says "widen the range or revert."
+1. **Should `deps fix` ever update an existing override** when re-audit shows the original range was insufficient? Today it leaves it; SKILL.md says "widen the range or revert."
 
 ## Cleanup before calling it 1.0
 

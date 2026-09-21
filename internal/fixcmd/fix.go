@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/robertkasza/deps/internal/auditci"
 	"github.com/robertkasza/deps/internal/pkgmgr"
 	"github.com/robertkasza/deps/internal/plan"
 	"github.com/robertkasza/deps/internal/pnpm"
@@ -51,7 +52,13 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	pm := pnpm.New().WithWarnWriter(stderr)
+	return run(opts, stdout, stderr, pnpm.New(), registry.New())
+}
+
+// run accepts external dependencies so command tests do not require pnpm or
+// network access.
+func run(opts Options, stdout, stderr io.Writer, pm *pnpm.Adapter, reg registry.Client) error {
+	pm = pm.WithWarnWriter(stderr)
 	fmt.Fprintln(stderr, "discovering workspaces...")
 	workspaces, err := pm.DiscoverWorkspaces(opts.Dir)
 	if err != nil {
@@ -59,8 +66,11 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	rootDir := monorepoRoot(workspaces, opts.Dir)
+	allowlist, err := auditci.Load(rootDir)
+	if err != nil {
+		return err
+	}
 
-	reg := registry.New()
 	planner := plan.New(reg)
 	planner.AllowMajor = opts.AllowMajor
 	configureCooldownRung(planner, pm, rootDir, stderr)
@@ -68,7 +78,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	// Phase 1: produce the plan (audit + triage + plan per workspace).
 	fmt.Fprintf(stderr, "auditing %d workspace(s) (concurrency=%d)...\n",
 		len(workspaces), opts.Concurrency)
-	results := processAll(pm, planner, workspaces, opts.Concurrency, stderr)
+	results := processAll(pm, planner, allowlist, workspaces, opts.Concurrency, stderr)
 
 	totalActionable, totalUnresolved, failedCount := summarize(results)
 	fmt.Fprintf(stderr,
@@ -123,7 +133,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		verifyScope = filterWorkspaces(workspaces, editedWorkspaces)
 	}
 	fmt.Fprintf(stderr, "re-auditing %d workspace(s)...\n", len(verifyScope))
-	verify := processAll(pm, planner, verifyScope, opts.Concurrency, stderr)
+	verify := processAll(pm, planner, allowlist, verifyScope, opts.Concurrency, stderr)
 	stillPresent := stillPresentGHSAs(verify, targetedGHSAs)
 
 	// Final report. Three distinct buckets the user needs to see:
@@ -235,6 +245,7 @@ type WorkspaceResult struct {
 func processAll(
 	pm pkgmgr.PkgManager,
 	planner *plan.Builder,
+	allowlist auditci.Allowlist,
 	workspaces []pkgmgr.Workspace,
 	concurrency int,
 	progress io.Writer,
@@ -251,7 +262,7 @@ func processAll(
 		total      = len(workspaces)
 	)
 
-	report := func(ws pkgmgr.Workspace, err error) {
+	report := func(ws pkgmgr.Workspace, skipped int, err error) {
 		progressMu.Lock()
 		defer progressMu.Unlock()
 		done++
@@ -260,6 +271,9 @@ func processAll(
 			fmt.Fprintf(progress, "  x %s (%d/%d): %v\n", label, done, total, err)
 		} else {
 			fmt.Fprintf(progress, "  o %s (%d/%d)\n", label, done, total)
+		}
+		if skipped > 0 {
+			fmt.Fprintf(progress, "    %d advisory finding(s) skipped (allowlisted)\n", skipped)
 		}
 	}
 
@@ -272,23 +286,24 @@ func processAll(
 			advs, err := pm.Audit(ws)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
-				report(ws, err)
+				report(ws, 0, err)
 				return
 			}
+			advs, skipped := allowlist.Filter(advs)
 			findings, err := triage.Run(advs)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
-				report(ws, err)
+				report(ws, skipped, err)
 				return
 			}
 			p, err := planner.Build(findings)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Err: err}
-				report(ws, err)
+				report(ws, skipped, err)
 				return
 			}
 			results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Plan: p}
-			report(ws, nil)
+			report(ws, skipped, nil)
 		}(i, ws)
 	}
 	wg.Wait()

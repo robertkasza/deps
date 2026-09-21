@@ -46,7 +46,7 @@ deps fix --dir /path/to/monorepo
 The remediation ladder per finding:
 
 | Finding | Action |
-|---|---|
+| --- | --- |
 | Direct dep, fix in same major | bump the version |
 | Direct dep, only major-bump fixes | report unresolved |
 | Transitive, parent has fix in same major | bump the parent |
@@ -54,10 +54,31 @@ The remediation ladder per finding:
 | Transitive, no parent fix exists | add `pnpm.overrides` entry |
 | No fix published anywhere | report unresolved |
 
+## Audit-ci allowlists
+
+Both commands read `audit-ci.json` and `audit-ci.jsonc` from the repository root,
+even when invoked inside a workspace. Add accepted advisory IDs to `allowlist`:
+
+```json
+{
+  "allowlist": ["GHSA-xxxx-yyyy-zzzz"]
+}
+```
+
+Matching findings are skipped during planning and post-fix verification. Skipped
+counts appear on stderr; allowlisted findings are omitted from JSON and do not
+cause a nonzero exit. If all findings are allowlisted, `fix` makes no changes.
+
+- `.jsonc` supports comments and trailing commas.
+- If both files exist, their entries are combined. Workspace-local files are ignored.
+- Only exact GHSA strings are supported, not package names, numeric IDs, path rules,
+  or object-form exceptions. Invalid/unsupported configurations fail with an error.
+- Other audit-ci settings are ignored. Neither file is modified.
+
 ## Exit codes
 
 | Code | Meaning |
-|---|---|
+| --- | --- |
 | `0` | Clean — no findings |
 | `10` | Actionable findings present, or unresolved findings remain after a successful fix |
 | `20` | Some targeted advisory is still present after re-audit (`unresolved-after-apply`) |
@@ -73,9 +94,8 @@ CI scripts can branch on these directly.
 
 ## Status
 
-`deps check` and `deps fix` are implemented and tested against a real-world
-fixture. `audit-ci.jsonc` allowlist support is planned but not yet implemented
-— see `DESIGN.md` for the backlog.
+`deps check` and `deps fix` are implemented, including root audit-ci allowlists,
+and tested against a real-world fixture. See `DESIGN.md` for the backlog.
 
 ## More
 
