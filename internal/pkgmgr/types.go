@@ -46,6 +46,14 @@ type Advisory struct {
 	Path            []string // dependency chain, root-first (e.g., ["request", "tough-cookie"])
 	Workspace       Workspace
 	URL             string // advisory URL
+
+	// AuditPath is the dependency path exactly as the package manager's
+	// audit reported it (e.g., ".>request>tough-cookie"), including any
+	// workspace segment. Used to match audit-ci path allowlist entries.
+	AuditPath string
+	// Version is the installed version of Package at this path, when the
+	// audit reports it.
+	Version string
 }
 
 // FindingKind distinguishes whether a vulnerable package is declared
@@ -130,6 +138,8 @@ type Edit struct {
 type Unresolved struct {
 	Finding Finding
 	Reason  string // e.g., "major-jump-required", "no-fix-available"
+	// Detail optionally explains Reason for this finding in prose.
+	Detail string
 }
 
 // Plan is the output of the plan stage and the input to apply.

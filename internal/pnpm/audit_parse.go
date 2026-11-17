@@ -67,6 +67,8 @@ func parseAudit(data []byte, ws pkgmgr.Workspace) ([]pkgmgr.Advisory, error) {
 					VulnerableRange: adv.VulnerableVersions,
 					FixedRange:      adv.PatchedVersions,
 					Path:            chain,
+					AuditPath:       path,
+					Version:         finding.Version,
 					Workspace:       ws,
 					URL:             adv.URL,
 				})

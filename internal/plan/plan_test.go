@@ -553,6 +553,70 @@ func TestBuild_TransitiveOverrideFallback(t *testing.T) {
 	}
 }
 
+// An override is keyed pkg@VulnerableRange and applies repo-wide, so it
+// must not be planned when it would also rewrite an allowlisted finding
+// of the same package (in any workspace) installed inside that range.
+func TestBuild_TransitiveOverrideBlockedByAllowlisted(t *testing.T) {
+	dir := t.TempDir()
+	ws := writePkg(t, dir, `{"dependencies": {"request": "^2.88.2"}}`)
+	reg := &fakeRegistry{
+		versions: map[string][]string{"request": {"2.88.2"}},
+		manifests: map[string]map[string]registry.Manifest{
+			"request": {"2.88.2": {Dependencies: map[string]string{"tough-cookie": "2.5.0"}}},
+		},
+	}
+	allowlisted := func(pkg, version string) pkgmgr.Advisory {
+		return pkgmgr.Advisory{
+			GHSA: "GHSA-a", Package: pkg, Version: version,
+			AuditPath: ".>legacy>" + pkg, Path: []string{"legacy", pkg},
+		}
+	}
+	cases := []struct {
+		name        string
+		parent      string // "missing" exercises the parent-not-in-manifest branch
+		allowlisted []pkgmgr.Advisory
+		blocked     bool
+	}{
+		{name: "none", parent: "request"},
+		{name: "in range", parent: "request", allowlisted: []pkgmgr.Advisory{allowlisted("tough-cookie", "2.5.0")}, blocked: true},
+		{name: "in range, parent not in manifest", parent: "missing", allowlisted: []pkgmgr.Advisory{allowlisted("tough-cookie", "2.5.0")}, blocked: true},
+		{name: "unknown version", parent: "request", allowlisted: []pkgmgr.Advisory{allowlisted("tough-cookie", "")}, blocked: true},
+		{name: "outside range", parent: "request", allowlisted: []pkgmgr.Advisory{allowlisted("tough-cookie", "4.1.3")}},
+		{name: "other package", parent: "request", allowlisted: []pkgmgr.Advisory{allowlisted("qs", "2.5.0")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := New(reg)
+			b.Allowlisted = tc.allowlisted
+			plan, err := b.Build([]pkgmgr.Finding{{
+				Kind:   pkgmgr.FindingTransitive,
+				Parent: tc.parent,
+				Advisory: pkgmgr.Advisory{
+					GHSA: "GHSA-z", Package: "tough-cookie",
+					VulnerableRange: "<4.1.3", FixedRange: ">=4.1.3",
+					Path: []string{tc.parent, "tough-cookie"}, Workspace: ws,
+				},
+			}})
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if !tc.blocked {
+				if len(plan.Actionable) != 1 || plan.Actionable[0].Kind != pkgmgr.EditOverrideAdd || len(plan.Unresolved) != 0 {
+					t.Fatalf("want override, got %+v", plan)
+				}
+				return
+			}
+			if len(plan.Actionable) != 0 || len(plan.Unresolved) != 1 {
+				t.Fatalf("want one unresolved, got %+v", plan)
+			}
+			u := plan.Unresolved[0]
+			if u.Reason != ReasonOverrideHitsAllowlisted || !strings.Contains(u.Detail, "legacy>tough-cookie") {
+				t.Errorf("unresolved = %+v", u)
+			}
+		})
+	}
+}
+
 // Two advisories on the same vuln package, fixed in different versions
 // (the fast-uri shape: 3.1.1 and 3.1.2). Both fall to override because
 // no parent version fixes them. The plan must merge into ONE override

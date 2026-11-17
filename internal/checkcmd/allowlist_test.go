@@ -115,6 +115,71 @@ func TestRunAllowlist(t *testing.T) {
 	}
 }
 
+// An override lands at the monorepo root, so a finding in one workspace must
+// not be overridden when that would rewrite another workspace's allowlisted
+// path (e.g. a legacy caller pinned to the vulnerable major on purpose).
+func TestRunOverrideBlockedByAllowlistedPath(t *testing.T) {
+	audit := func(path string) []byte {
+		return []byte(`{"advisories":{"1":{"github_advisory_id":"GHSA-xxxx-yyyy-zzzz","module_name":"mini",` +
+			`"severity":"high","vulnerable_versions":"<2.0.0","patched_versions":">=2.0.0",` +
+			`"findings":[{"version":"1.0.0","paths":["` + path + `"]}]}}}`)
+	}
+	for _, tc := range []struct {
+		name, config string
+		wantReason   string
+	}{
+		{name: "no allowlist", config: `{"allowlist":[]}`},
+		{name: "allowlisted path elsewhere", config: `{"allowlist":["GHSA-xxxx-yyyy-zzzz|legacy>mini"]}`, wantReason: "override-hits-allowlisted-path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeAllowlistFile(t, root, "package.json", `{}`)
+			writeAllowlistFile(t, root, "pnpm-workspace.yaml", "packages: ['apps/*']\nminimumReleaseAge: 0\n")
+			writeAllowlistFile(t, root, "apps/web/package.json", `{}`)
+			writeAllowlistFile(t, root, "audit-ci.json", tc.config)
+			pm := pnpm.New().WithRunner(func(dir, name string, args ...string) ([]byte, []byte, int, error) {
+				switch strings.Join(args, " ") {
+				case "--version":
+					return []byte("10.0.0"), nil, 0, nil
+				case "audit --json":
+					if dir == root {
+						return audit(".>legacy>mini"), nil, 1, nil
+					}
+					return audit(".>modern>mini"), nil, 1, nil
+				default:
+					return nil, nil, -1, fmt.Errorf("unexpected command: %s %v", name, args)
+				}
+			})
+			var stdout, stderr bytes.Buffer
+			err := run(Options{Dir: root, JSON: true, Severity: "low", Concurrency: 1}, &stdout, &stderr, pm, allowlistRegistry{})
+			if coded, ok := err.(interface{ Code() int }); !ok || coded.Code() != 10 {
+				t.Fatalf("err = %v, want exit 10; stderr: %s", err, &stderr)
+			}
+			var out jsonOutput
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("stdout is not clean JSON: %v: %s", err, &stdout)
+			}
+			for _, ws := range out.Workspaces {
+				if ws.IsRoot {
+					continue
+				}
+				if tc.wantReason == "" {
+					if len(ws.Actionable) != 1 || ws.Actionable[0].Kind != "override-add" {
+						t.Fatalf("want override: %+v", ws)
+					}
+					return
+				}
+				if len(ws.Actionable) != 0 || len(ws.Unresolved) != 1 ||
+					ws.Unresolved[0].Reason != tc.wantReason || !strings.Contains(ws.Unresolved[0].Detail, "legacy>mini") {
+					t.Fatalf("want blocked override: %+v", ws)
+				}
+				return
+			}
+			t.Fatalf("member workspace missing: %+v", out)
+		})
+	}
+}
+
 type allowlistRegistry struct{}
 
 func (allowlistRegistry) Versions(string) ([]string, error) {

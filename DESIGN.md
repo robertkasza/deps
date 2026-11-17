@@ -27,7 +27,7 @@ The motivating problem: in a pnpm monorepo where CI fails on any vulnerability, 
 - Concurrency control: `--concurrency` flag, default 3 (npm rate-limit-friendly)
 - Exit codes: `0` clean · `10` actionable / unresolved present · `20` `unresolved-after-apply` · `1` tool error
 - Tests across all packages with fakes for the runner and registry; real `pnpm audit --json` fixture in `internal/pnpm/testdata/`
-- **`audit-ci.json` / `audit-ci.jsonc` allowlists.** Both commands load root-level GHSA exceptions once after workspace discovery and filter before triage, including post-apply verification. See “Audit-ci allowlists” below.
+- **`audit-ci.json` / `audit-ci.jsonc` allowlists.** Both commands load root-level GHSA (and GHSA|path) exceptions once after workspace discovery and filter before triage, including post-apply verification. See “Audit-ci allowlists” below.
 
 ### Required, not yet implemented
 
@@ -119,6 +119,7 @@ Groups findings, then walks the SKILL.md ladder per advisory within each group, 
 | Transitive, latest same-major parent's predicted resolution clears it | participates in the group's `bump-parent` |
 | Transitive, only newer-major parent's predicted resolution clears it | falls through to cooldown-bypass/`override-add` (the vuln pkg only needs a same-major bump, which an override delivers without the breaking parent bump); the major-jump alternative is recorded in `Edit.RejectionNotes` |
 | Transitive, no parent version's predicted resolution clears it | contributes to an `override-add` (merged across the workspace's vuln pkg) |
+| Transitive, would need an override that also matches an allowlisted finding | `unresolved{reason: override-hits-allowlisted-path}` (see “Audit-ci allowlists”) |
 
 `major-jump-required` therefore means *the direct dependency in the manifest itself needs a major bump* — it is never used for transitive findings, where the parent (not the vuln pkg) is what would need the major bump.
 | No fix published anywhere | `unresolved{reason: no-fix-available}` |
@@ -199,9 +200,15 @@ entries are combined; duplicates have no additional effect.
 }
 ```
 
-Only a top-level `allowlist` array of exact GHSA ID strings is supported. Other
+Only a top-level `allowlist` array of strings is supported. Each entry is either
+an exact GHSA ID, which allows every finding of that advisory, or audit-ci's
+path-scoped form `"GHSA-xxxx-yyyy-zzzz|<path>"`, which allows only findings whose
+dependency path matches. As in audit-ci, the path is the one `pnpm audit`
+reports with the leading `.>` removed (e.g. `eslint>minimatch`; hoisted-mode
+workspace segments such as `apps__web>` are kept), each run of `*` matches any
+characters including `>`, and the pattern must match the whole path. Other
 audit-ci settings, such as severity thresholds, are ignored. Package names,
-numeric IDs, path/wildcard rules, and object-form exceptions (including expiry
+numeric IDs, wildcard advisory IDs, and object-form exceptions (including expiry
 metadata) are not supported and produce an error rather than being interpreted
 as broader exceptions. Missing files or a missing/empty allowlist mean no
 exceptions. Malformed or unreadable files fail the command before auditing or
@@ -215,6 +222,19 @@ exit codes. An entirely allowlisted run is clean; `fix` does not install or writ
 anything. Filtered findings are omitted from JSON. Human progress on stderr
 reports a separate `skipped (allowlisted)` count per workspace/audit; counts are
 findings (dependency paths), not unique GHSAs. Configuration files are read-only.
+
+Filtered findings are not discarded: an override is keyed `<pkg>@<vulnerable-range>`
+and lands at the monorepo root, so it would also move allowlisted paths of the same
+package (for example legacy callers deliberately left on an old major). Every
+workspace is therefore audited and filtered before any is planned, and the
+planner receives all allowlisted findings. When the only remaining remedy for a
+finding is an override whose vulnerable range contains the installed version of
+an allowlisted finding of the same package (in any workspace; a finding without a
+version counts as a match), the finding is reported as
+`unresolved{reason: override-hits-allowlisted-path}` with a `detail` naming the
+allowlisted path, instead of planning the override. Only overrides are guarded:
+bumps edit one manifest's own dependency, and cooldown bypasses only lift the
+release-age filter for a specific patched version.
 
 ## Output and CI-readiness
 

@@ -81,6 +81,8 @@ func TestLoadInvalid(t *testing.T) {
 			`{"allowlist": {}}`, `{"allowlist": [1234]}`, `{"allowlist": [null]}`,
 			`{"allowlist": [""]}`, `{"allowlist": ["lodash"]}`,
 			`{"allowlist": ["GHSA-*"]}`, `{"allowlist": ["GHSA-xxxx-yyyy-zzzz>lodash"]}`,
+			`{"allowlist": ["GHSA-xxxx-yyyy-zzzz|"]}`, `{"allowlist": ["GHSA-*|*>lodash"]}`,
+			`{"allowlist": ["lodash|*>lodash"]}`, `{"allowlist": ["|lodash"]}`,
 			`{"allowlist": [{"GHSA-xxxx-yyyy-zzzz": {"expiry": "2030-01-01"}}]}`,
 		} {
 			t.Run(name+"/"+content, func(t *testing.T) {
@@ -91,6 +93,61 @@ func TestLoadInvalid(t *testing.T) {
 					t.Fatalf("want error naming config file, got %v", err)
 				}
 			})
+		}
+	}
+}
+
+func TestLoadPaths(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "audit-ci.jsonc", `{
+		"allowlist": [
+			// scoped exceptions
+			"`+allowedGHSA+`|glob>minimatch",
+			"`+allowedGHSA+`|*>eslint>minimatch", // trailing comment
+			"`+otherGHSA+`",
+		]
+	}`)
+	allowed, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allowed.ids) != 1 || len(allowed.paths[allowedGHSA]) != 2 {
+		t.Fatalf("ids = %v, paths = %v", allowed.ids, allowed.paths)
+	}
+}
+
+func TestFilterPaths(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "audit-ci.json", `{"allowlist": [
+		"`+allowedGHSA+`|glob>minimatch",
+		"`+allowedGHSA+`|*>eslint>minimatch",
+		"`+allowedGHSA+`|a.b>**>c"
+	]}`)
+	allowed, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		advisory pkgmgr.Advisory
+		allowed  bool
+	}{
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>glob>minimatch"}, true},
+		{pkgmgr.Advisory{GHSA: allowedGHSA, Path: []string{"glob", "minimatch"}}, true}, // no raw path
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>x>glob>minimatch"}, false},    // exact without *
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>@scope/x>eslint>minimatch"}, true},
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>a>b>eslint>minimatch"}, true},  // * spans ">"
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>eslint>minimatch"}, false},     // "*>" needs a segment
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>x>eslint>minimatch>y"}, false}, // anchored
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: "apps__web>glob>minimatch"}, false},
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: "apps__web>eslint>minimatch"}, true},
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>a.b>x>c"}, true},
+		{pkgmgr.Advisory{GHSA: allowedGHSA, AuditPath: ".>aXb>x>c"}, false}, // "." is literal
+		{pkgmgr.Advisory{GHSA: otherGHSA, AuditPath: ".>glob>minimatch"}, false},
+	}
+	for _, tc := range cases {
+		kept, skipped := allowed.Filter([]pkgmgr.Advisory{tc.advisory})
+		if got := len(skipped) == 1 && len(kept) == 0; got != tc.allowed {
+			t.Errorf("%s %q %v: allowed = %v, want %v", tc.advisory.GHSA, tc.advisory.AuditPath, tc.advisory.Path, got, tc.allowed)
 		}
 	}
 }
@@ -119,14 +176,15 @@ func TestFilter(t *testing.T) {
 	original := append([]pkgmgr.Advisory(nil), input...)
 	kept, skipped := allowed.Filter(input)
 	want := []pkgmgr.Advisory{input[1], input[3], input[4]}
-	if skipped != 2 || !reflect.DeepEqual(kept, want) {
-		t.Fatalf("Filter = %v, %d; want %v, 2", kept, skipped, want)
+	wantSkipped := []pkgmgr.Advisory{input[0], input[2]}
+	if !reflect.DeepEqual(kept, want) || !reflect.DeepEqual(skipped, wantSkipped) {
+		t.Fatalf("Filter = %v, %v; want %v, %v", kept, skipped, want, wantSkipped)
 	}
 	if !reflect.DeepEqual(input, original) {
 		t.Fatal("Filter mutated input")
 	}
 	kept, skipped = (Allowlist{}).Filter(input)
-	if skipped != 0 || !reflect.DeepEqual(kept, input) {
+	if len(skipped) != 0 || !reflect.DeepEqual(kept, input) {
 		t.Fatal("zero-value allowlist must preserve all advisories")
 	}
 }
@@ -140,7 +198,7 @@ func TestLoadSnapshot(t *testing.T) {
 	}
 	writeFile(t, root, "audit-ci.json", `{"allowlist": []}`)
 	kept, skipped := allowed.Filter([]pkgmgr.Advisory{{GHSA: allowedGHSA}})
-	if len(kept) != 0 || skipped != 1 {
+	if len(kept) != 0 || len(skipped) != 1 {
 		t.Fatal("loaded allowlist must remain stable for the entire command")
 	}
 }

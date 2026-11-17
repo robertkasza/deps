@@ -215,6 +215,9 @@ func printUnresolved(w io.Writer, results []WorkspaceResult) {
 			a := u.Finding.Advisory
 			fmt.Fprintf(w, "    - %s  %s  %s  (%s)  in %s\n",
 				a.GHSA, a.Package, a.Severity, u.Reason, workspaceLabel(r.Workspace))
+			if u.Detail != "" {
+				fmt.Fprintf(w, "        %s\n", u.Detail)
+			}
 		}
 	}
 }
@@ -254,6 +257,7 @@ func processAll(
 		concurrency = 1
 	}
 	results := make([]WorkspaceResult, len(workspaces))
+	skipped := make([][]pkgmgr.Advisory, len(workspaces))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var (
@@ -277,6 +281,9 @@ func processAll(
 		}
 	}
 
+	// Phase 1: audit, filter, and triage every workspace. Planning waits
+	// until all allowlisted findings are known, because overrides land at
+	// the monorepo root and can rewrite allowlisted paths in any workspace.
 	for i, ws := range workspaces {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -289,22 +296,45 @@ func processAll(
 				report(ws, 0, err)
 				return
 			}
-			advs, skipped := allowlist.Filter(advs)
+			advs, skipped[i] = allowlist.Filter(advs)
 			findings, err := triage.Run(advs)
 			if err != nil {
 				results[i] = WorkspaceResult{Workspace: ws, Err: err}
-				report(ws, skipped, err)
+				report(ws, len(skipped[i]), err)
 				return
 			}
-			p, err := planner.Build(findings)
-			if err != nil {
-				results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Err: err}
-				report(ws, skipped, err)
-				return
-			}
-			results[i] = WorkspaceResult{Workspace: ws, Findings: findings, Plan: p}
-			report(ws, skipped, nil)
+			results[i] = WorkspaceResult{Workspace: ws, Findings: findings}
+			report(ws, len(skipped[i]), nil)
 		}(i, ws)
+	}
+	wg.Wait()
+
+	scoped := *planner
+	scoped.Allowlisted = nil
+	for _, s := range skipped {
+		scoped.Allowlisted = append(scoped.Allowlisted, s...)
+	}
+
+	// Phase 2: plan each successfully triaged workspace.
+	for i := range results {
+		if results[i].Err != nil {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r *WorkspaceResult) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p, err := scoped.Build(r.Findings)
+			if err != nil {
+				r.Err = err
+				progressMu.Lock()
+				fmt.Fprintf(progress, "  x %s: plan: %v\n", workspaceLabel(r.Workspace), err)
+				progressMu.Unlock()
+				return
+			}
+			r.Plan = p
+		}(&results[i])
 	}
 	wg.Wait()
 	return results

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/robertkasza/deps/internal/pkgmgr"
@@ -118,6 +119,9 @@ func TestParseAudit_NhostDocsFixture_PerWorkspaceMode(t *testing.T) {
 		}
 		if len(a.Path) == 0 {
 			t.Errorf("empty path for %s", a.GHSA)
+		}
+		if want := ".>" + strings.Join(a.Path, ">"); a.AuditPath != want {
+			t.Errorf("AuditPath = %q, want raw path %q", a.AuditPath, want)
 		}
 	}
 }

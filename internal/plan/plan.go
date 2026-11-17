@@ -19,6 +19,7 @@
 //	  1. latest same-major parent resolves vuln to a fixed version -> bump-parent (one bump per group covering all advisories it patches)
 //	  2. only newer-major parent resolves to a fixed version       -> unresolved{major-jump-required}
 //	  3. no parent version resolves to a fixed version             -> override-add (merged across the workspace's vuln pkg)
+//	     ...but the override would also rewrite an allowlisted path -> unresolved{override-hits-allowlisted-path}
 //	  4. no patched version of vuln pkg published anywhere         -> unresolved{no-fix-available}
 //
 // Plan operates on package-manager-agnostic types from internal/pkgmgr
@@ -41,6 +42,9 @@ const (
 	ReasonNoFixAvailable    = "no-fix-available"
 	ReasonMajorJumpRequired = "major-jump-required"
 	ReasonParentNotInDeps   = "parent-not-in-deps"
+	// ReasonOverrideHitsAllowlisted marks a finding whose only remedy is a
+	// repo-wide override that would also change an allowlisted finding.
+	ReasonOverrideHitsAllowlisted = "override-hits-allowlisted-path"
 )
 
 // TreeInspector enumerates importers of a vulnerable package in the
@@ -75,6 +79,11 @@ type Builder struct {
 	// drifted the package's effective resolution past the declared
 	// range. See CanBypassCooldown.
 	AllowMajor bool
+	// Allowlisted holds the findings removed by the audit-ci allowlist
+	// across every workspace. Overrides apply repo-wide, so an override
+	// that would also rewrite one of these is refused rather than
+	// silently changing a dependency the user chose to leave alone.
+	Allowlisted []pkgmgr.Advisory
 }
 
 // New returns a Builder using the given registry client.
@@ -356,6 +365,10 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 		// chain longer than 2; fall everything through to override.
 		var edits []pkgmgr.Edit
 		for _, f := range withFix {
+			if u, blocked := b.overrideBlocked(f); blocked {
+				unresolved = append(unresolved, u)
+				continue
+			}
 			edits = append(edits, b.planOverride(f))
 		}
 		return edits, unresolved, nil
@@ -455,6 +468,10 @@ func (b *Builder) planTransitiveGroup(group []pkgmgr.Finding, cache manifestCach
 		e, cdReason := b.tryCooldownBypass(r.finding)
 		if cdReason == "" {
 			edits = append(edits, e)
+			continue
+		}
+		if u, blocked := b.overrideBlocked(r.finding); blocked {
+			unresolved = append(unresolved, u)
 			continue
 		}
 		ov := b.planOverride(r.finding)
@@ -728,6 +745,37 @@ func lowestSatisfying(versions []string, c *semver.Constraints) *semver.Version 
 		}
 	}
 	return pool[0]
+}
+
+// overrideBlocked reports whether the override planOverride would emit
+// for f also matches an allowlisted finding: the override key is
+// pkg@VulnerableRange, so it rewrites every installed version of the
+// package in that range, including allowlisted paths. A version-less
+// allowlisted finding of the same package is treated as a match.
+func (b *Builder) overrideBlocked(f pkgmgr.Finding) (pkgmgr.Unresolved, bool) {
+	vulnRange, err := semver.NewConstraint(f.Advisory.VulnerableRange)
+	for _, a := range b.Allowlisted {
+		if a.Package != f.Advisory.Package {
+			continue
+		}
+		if err == nil && a.Version != "" {
+			v, verr := semver.NewVersion(a.Version)
+			if verr == nil && !vulnRange.Check(v) {
+				continue
+			}
+		}
+		path := a.AuditPath
+		if path == "" {
+			path = strings.Join(a.Path, ">")
+		}
+		return pkgmgr.Unresolved{
+			Finding: f,
+			Reason:  ReasonOverrideHitsAllowlisted,
+			Detail: fmt.Sprintf("override %s@%s would also change allowlisted %s@%s (%s at %s)",
+				f.Advisory.Package, f.Advisory.VulnerableRange, a.Package, a.Version, a.GHSA, path),
+		}, true
+	}
+	return pkgmgr.Unresolved{}, false
 }
 
 // planOverride builds an EditOverrideAdd targeting the monorepo root's
